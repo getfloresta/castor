@@ -4,8 +4,6 @@
 //! of Bitcoin Core. But keep in mind that while doing the initial sync, it will be slower and
 //! you risk getting banned from the server if you do too many requests.
 
-use std::fmt::Display;
-
 use anyhow::Result;
 use bitcoin::block::Header;
 use bitcoin::consensus;
@@ -91,55 +89,6 @@ impl Blockchain for EsploraBlockchain {
         })
     }
 }
-#[derive(Debug)]
-pub enum EsploraError {
-    Reqwest(reqwest::Error),
-    BitcoinCore(bitcoincore_rpc::Error),
-    Bitcoin(bitcoin::consensus::encode::Error),
-    Hex(hex::FromHexError),
-    Json(serde_json::Error),
-}
-
-impl From<reqwest::Error> for EsploraError {
-    fn from(e: reqwest::Error) -> Self {
-        Self::Reqwest(e)
-    }
-}
-impl From<serde_json::Error> for EsploraError {
-    fn from(e: serde_json::Error) -> Self {
-        Self::Json(e)
-    }
-}
-
-impl From<bitcoincore_rpc::Error> for EsploraError {
-    fn from(e: bitcoincore_rpc::Error) -> Self {
-        Self::BitcoinCore(e)
-    }
-}
-
-impl From<bitcoin::consensus::encode::Error> for EsploraError {
-    fn from(e: bitcoin::consensus::encode::Error) -> Self {
-        Self::Bitcoin(e)
-    }
-}
-
-impl From<hex::FromHexError> for EsploraError {
-    fn from(e: hex::FromHexError) -> Self {
-        Self::Hex(e)
-    }
-}
-impl Display for EsploraError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EsploraError::Reqwest(e) => write!(f, "Reqwest error: {}", e),
-            EsploraError::BitcoinCore(e) => write!(f, "Bitcoin Core error: {}", e),
-            EsploraError::Bitcoin(e) => write!(f, "Bitcoin error: {}", e),
-            EsploraError::Hex(e) => write!(f, "Hex error: {}", e),
-            EsploraError::Json(e) => write!(f, "Json error: {}", e),
-        }
-    }
-}
-impl std::error::Error for EsploraError {}
 #[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader, Write};

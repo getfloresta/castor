@@ -206,7 +206,6 @@ fn kernel_chain_type(network: Network) -> Result<ChainType> {
         Network::Testnet4 => Ok(ChainType::Testnet4),
         Network::Signet => Ok(ChainType::Signet),
         Network::Regtest => Ok(ChainType::Regtest),
-        _ => bail!("unsupported Bitcoin network {network}"),
     }
 }
 
@@ -217,7 +216,6 @@ fn network_data_dir(bitcoin_data_dir: &Path, network: Network) -> PathBuf {
         Network::Testnet4 => bitcoin_data_dir.join("testnet4"),
         Network::Signet => bitcoin_data_dir.join("signet"),
         Network::Regtest => bitcoin_data_dir.join("regtest"),
-        _ => bitcoin_data_dir.join(network.to_string()),
     }
 }
 

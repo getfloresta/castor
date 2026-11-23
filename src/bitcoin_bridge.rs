@@ -28,6 +28,7 @@ use crate::parallel_forest::build_parallel_forest;
 use crate::parallel_forest::KernelBlockSource;
 use crate::parallel_forest::ParallelForestConfig;
 use crate::prover::FlatFileProver;
+use crate::recent_blocks::RecentBlocks;
 use crate::subdir;
 
 pub fn run_bridge() -> anyhow::Result<()> {
@@ -128,6 +129,9 @@ pub fn run_bridge() -> anyhow::Result<()> {
             .pollard_memory_mib
             .checked_mul(1024 * 1024)
             .context("Pollard memory limit exceeds usize")?;
+        let recent_blocks = Arc::new(RecentBlocks::open(std::path::Path::new(&subdir(
+            "recent-blocks.dat",
+        )))?);
         let mut prover = FlatFileProver::new(
             client.clone(),
             header_index.clone(),
@@ -136,6 +140,7 @@ pub fn run_bridge() -> anyhow::Result<()> {
             &leaf_map_path,
             proof_file.clone(),
             proof_index.clone(),
+            recent_blocks.clone(),
             hints.stop_height(),
             !cli_options.forest_no_mlock,
             pollard_memory_limit,
@@ -149,6 +154,7 @@ pub fn run_bridge() -> anyhow::Result<()> {
             ProofBackend::CompactProofs(proof_file),
             Some(client),
             Some(header_index),
+            recent_blocks,
             block_notifier_rx,
         )?;
         return prover.keep_up();
@@ -183,6 +189,7 @@ fn start_p2p(
     proof_backend: ProofBackend,
     header_source: Option<Arc<dyn Blockchain>>,
     header_index: Option<Arc<HeaderIndex>>,
+    recent_blocks: Arc<RecentBlocks>,
     block_notifier: std::sync::mpsc::Receiver<bitcoin::BlockHash>,
 ) -> anyhow::Result<()> {
     info!("Starting P2PV2-only BIP 183 proof server");
@@ -201,6 +208,7 @@ fn start_p2p(
         proof_backend,
         header_index,
         header_source,
+        recent_blocks,
     };
     node::Node::run(p2p_address, worker_context, block_notifier)?;
     Ok(())

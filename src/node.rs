@@ -19,9 +19,9 @@
 //! ignored without invoking their potentially allocation-heavy Bitcoin
 //! decoders.
 //!
-//! Proof requests read compact-only records through [`ProofBackend`]. Bitcoin
-//! blocks are not retained; block downloads receive `notfound`. Headers come
-//! from the positioned header index, chain cache, or configured RPC source.
+//! Proof requests read compact-only records through [`ProofBackend`]. Recent
+//! canonical blocks come from the bounded [`RecentBlocks`] ring; older or
+//! unavailable blocks receive `notfound`. Headers use local indexes or RPC.
 //!
 //! # Admission and failure isolation
 //!
@@ -43,6 +43,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::fmt::Display;
 use std::io::Read;
 use std::io::Write;
@@ -101,6 +102,7 @@ use crate::blockfile::ProofFile;
 use crate::chaininterface::Blockchain;
 use crate::chainview::ChainView;
 use crate::header_index::HeaderIndex;
+use crate::recent_blocks::RecentBlocks;
 use crate::udata::CompactBlockProof;
 use crate::udata::CompactLeafData;
 
@@ -125,6 +127,8 @@ const READ_BUFFER_SIZE: usize = 64 * 1_024;
 /// Per-readiness byte budget, preventing a continuously readable peer from
 /// monopolizing a worker.
 const MAX_READ_BYTES_PER_EVENT: usize = 256 * 1_024;
+/// Bound output work even when the socket can accept an entire getdata batch.
+const MAX_WRITE_BYTES_PER_EVENT: usize = 256 * 1_024;
 const MAX_PACKET_SIZE: usize = 4_000_014;
 /// Largest inbound encrypted packet accepted by the request server.
 const MAX_INBOUND_PACKET_SIZE: usize = 256 * 1_024;
@@ -478,6 +482,9 @@ pub struct WorkerContext {
     /// The index used to locate records in the selected proof backend.
     pub proof_index: Arc<BlocksIndex>,
 
+    /// Canonical recent blocks, published only after proving catches up.
+    pub recent_blocks: Arc<RecentBlocks>,
+
     /// Cached active-chain metadata and headers.
     pub chainview: Arc<ChainView>,
 
@@ -734,9 +741,9 @@ impl Worker {
         for token in tokens {
             let result = match self.peers.get_mut(&token) {
                 Some(connection) if connection.peer.is_established() => Self::protect_peer(|| {
-                    connection.peer.send_message(NetworkMessage::Inv(vec![
-                        Inventory::WitnessBlock(block_hash),
-                    ]))
+                    // Coalesce tip announcements while a slow reader downloads blocks.
+                    connection.peer.pending_announcement = Some(block_hash);
+                    Ok(())
                 }),
                 Some(_) | None => continue,
             };
@@ -829,7 +836,7 @@ impl Worker {
             return Ok(());
         };
         let interest = if connection.peer.wants_write() {
-            Interest::READABLE | Interest::WRITABLE
+            Interest::WRITABLE
         } else {
             Interest::READABLE
         };
@@ -1079,6 +1086,9 @@ struct Peer {
     inbound: Option<InboundCipher>,
     outbound: Option<OutboundCipher>,
     packet_size: Option<usize>,
+    /// At most one bounded getdata batch; input pauses until output drains.
+    pending_inventory: VecDeque<Inventory>,
+    pending_announcement: Option<BlockHash>,
     rate_limiter: MessageRateLimiter,
     read_buffer: Vec<u8>,
     read_position: usize,
@@ -1103,6 +1113,8 @@ impl Peer {
             inbound: None,
             outbound: None,
             packet_size: None,
+            pending_inventory: VecDeque::new(),
+            pending_announcement: None,
             rate_limiter: MessageRateLimiter::new(now),
             read_buffer: Vec::new(),
             read_position: 0,
@@ -1169,6 +1181,9 @@ impl Peer {
         let mut buffer = [0; READ_BUFFER_SIZE];
         let mut bytes_read = 0;
         while bytes_read < MAX_READ_BYTES_PER_EVENT {
+            if self.is_established() && self.wants_write() {
+                return Ok(());
+            }
             let remaining = MAX_READ_BYTES_PER_EVENT - bytes_read;
             let read_limit = remaining.min(buffer.len());
             match stream.read(&mut buffer[..read_limit]) {
@@ -1371,7 +1386,7 @@ impl Peer {
             .take()
             .ok_or(PeerError::InvalidHandshakeState)?;
         let result = (|| {
-            loop {
+            while !self.wants_write() {
                 if self.packet_size.is_none() {
                     let length_end = self.read_position + bip324::NUM_LENGTH_BYTES;
                     let Some(length) = self.read_buffer.get(self.read_position..length_end) else {
@@ -1441,24 +1456,54 @@ impl Peer {
     }
 
     fn on_writable(&mut self, stream: &mut TcpStream) -> Result<(), PeerError> {
-        while self.wants_write() {
-            match stream.write(&self.write_buffer[self.write_position..]) {
-                Ok(0) => return Err(PeerError::Disconnected),
-                Ok(written) => self.write_position += written,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Ok(());
+        let mut bytes_written = 0;
+        while bytes_written < MAX_WRITE_BYTES_PER_EVENT {
+            if self.write_position == self.write_buffer.len() {
+                self.write_buffer.clear();
+                self.write_position = 0;
+                if let Some(response) = self.next_get_data_response()? {
+                    self.send_message(response)?;
+                } else if let Some(hash) = self.pending_announcement.take() {
+                    self.send_message(NetworkMessage::Inv(vec![Inventory::Block(hash)]))?;
+                } else {
+                    // Readiness may have already delivered the next request into
+                    // read_buffer. Resume it without waiting for another read edge.
+                    self.process_input()?;
+                    if self.write_buffer.is_empty() {
+                        if self.wants_write() {
+                            continue;
+                        }
+                        return Ok(());
+                    }
                 }
+            }
+            let end = self
+                .write_buffer
+                .len()
+                .min(self.write_position + MAX_WRITE_BYTES_PER_EVENT - bytes_written);
+            match stream.write(&self.write_buffer[self.write_position..end]) {
+                Ok(0) => return Err(PeerError::Disconnected),
+                Ok(written) => {
+                    self.write_position += written;
+                    bytes_written += written;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error.into()),
             }
         }
-        self.write_buffer.clear();
-        self.write_position = 0;
+        // A batch can end exactly at the byte budget with another encrypted
+        // request already buffered. Keep writable interest to resume that input.
+        if self.write_position == self.write_buffer.len() && !self.wants_write() {
+            self.process_input()?;
+        }
         Ok(())
     }
 
     fn wants_write(&self) -> bool {
         self.write_position < self.write_buffer.len()
+            || !self.pending_inventory.is_empty()
+            || self.pending_announcement.is_some()
     }
 
     fn send_message(&mut self, message: NetworkMessage) -> Result<(), PeerError> {
@@ -1533,7 +1578,7 @@ impl Peer {
                 );
                 self.send_message(NetworkMessage::Version(VersionMessage {
                     version: 70016,
-                    services: Self::advertised_services(),
+                    services: self.advertised_services(),
                     timestamp: version.timestamp.saturating_add(1),
                     receiver: version.sender.clone(),
                     sender: version.receiver,
@@ -1560,13 +1605,37 @@ impl Peer {
     }
 
     fn handle_get_data(&mut self, inventory: Vec<Inventory>) -> Result<(), PeerError> {
-        if inventory.len() > MAX_GETDATA_ITEMS as usize {
-            return Err(PeerError::TooManyInventoryItems(inventory.len() as u64));
+        let count = self.pending_inventory.len().saturating_add(inventory.len());
+        if count > MAX_GETDATA_ITEMS as usize {
+            return Err(PeerError::TooManyInventoryItems(count as u64));
         }
-        if !inventory.is_empty() {
-            self.send_message(NetworkMessage::NotFound(inventory))?;
-        }
+        self.pending_inventory.extend(inventory);
         Ok(())
+    }
+
+    /// Load only the next response, after the preceding encrypted output drains.
+    fn next_get_data_response(&mut self) -> Result<Option<NetworkMessage>, PeerError> {
+        let Some(item) = self.pending_inventory.pop_front() else {
+            return Ok(None);
+        };
+        if let Inventory::Block(hash) | Inventory::WitnessBlock(hash) = &item {
+            if let Some(mut block) = self
+                .context
+                .recent_blocks
+                .get(*hash)
+                .map_err(PeerError::RecentBlocks)?
+            {
+                if matches!(item, Inventory::Block(_)) {
+                    for transaction in &mut block.txdata {
+                        for input in &mut transaction.input {
+                            input.witness.clear();
+                        }
+                    }
+                }
+                return Ok(Some(NetworkMessage::Block(block)));
+            }
+        }
+        Ok(Some(NetworkMessage::NotFound(vec![item])))
     }
 
     fn handle_get_utreexo_proof(&mut self, request: GetUtreexoProof) -> Result<(), PeerError> {
@@ -1629,8 +1698,14 @@ impl Peer {
         )
     }
 
-    fn advertised_services() -> ServiceFlags {
-        ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | ServiceFlags::from(NODE_UTREEXO)
+    fn advertised_services(&self) -> ServiceFlags {
+        let services =
+            ServiceFlags::WITNESS | ServiceFlags::P2P_V2 | ServiceFlags::from(NODE_UTREEXO);
+        if self.context.recent_blocks.is_ready() {
+            services | ServiceFlags::NETWORK_LIMITED
+        } else {
+            services
+        }
     }
 }
 
@@ -2137,6 +2212,7 @@ enum PeerError {
     ProofBitmapTooLarge,
     Protocol(bip324::Error),
     RateLimitExceeded,
+    RecentBlocks(anyhow::Error),
     Rpc(anyhow::Error),
     Storage(kv::Error),
     TooManyInventoryItems(u64),
@@ -2173,6 +2249,7 @@ impl Display for PeerError {
             Self::ProofBitmapTooLarge => formatter.write_str("BIP 183 proof bitmap is too large"),
             Self::Protocol(error) => write!(formatter, "BIP 324 error: {error}"),
             Self::RateLimitExceeded => formatter.write_str("peer exceeded the message rate limit"),
+            Self::RecentBlocks(error) => write!(formatter, "recent block storage error: {error:#}"),
             Self::Rpc(error) => write!(formatter, "header RPC error: {error:#}"),
             Self::Storage(error) => write!(formatter, "peer storage error: {error}"),
             Self::TooManyInventoryItems(count) => {
@@ -2614,11 +2691,310 @@ mod tests {
             proof_index: Arc::new(BlocksIndex {
                 database: store("index"),
             }),
+            recent_blocks: Arc::new(
+                RecentBlocks::open_test(&root.join("recent-blocks.dat"))
+                    .expect("open test recent blocks"),
+            ),
             chainview: Arc::new(ChainView::new(store("chainview"))),
             header_index: None,
             header_source: None,
             magic: Magic::REGTEST,
         }
+    }
+
+    fn recent_block_test_storage(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "bridge-{name}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    fn recent_block_chain(context: &WorkerContext, length: u32) -> Vec<bitcoin::Block> {
+        let mut blocks = Vec::new();
+        let mut block = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        // Near the test slot limit: a maximum getdata batch exceeds the output cap.
+        block.txdata[0].input[0].witness.push(vec![0x42; 3_750]);
+        for height in 0..length {
+            if height > 0 {
+                block.header.prev_blockhash = block.block_hash();
+                block.header.nonce = height;
+            }
+            context.recent_blocks.put(height, &block).unwrap();
+            blocks.push(block.clone());
+        }
+        blocks
+    }
+
+    #[test]
+    fn recent_block_services_follow_contiguous_published_window() {
+        let storage = recent_block_test_storage("limited-services");
+        let context = test_worker_context(&storage);
+        let peer = Peer::new(context.clone()).unwrap();
+        assert!(!peer
+            .advertised_services()
+            .has(ServiceFlags::NETWORK_LIMITED));
+        let blocks = recent_block_chain(&context, 300);
+        // Merely storing the blocks does not publish them.
+        assert!(!peer
+            .advertised_services()
+            .has(ServiceFlags::NETWORK_LIMITED));
+        context
+            .recent_blocks
+            .set_tip(299, blocks[299].block_hash())
+            .unwrap();
+        let services = peer.advertised_services();
+        assert!(services.has(ServiceFlags::NETWORK_LIMITED));
+        assert!(services.has(ServiceFlags::WITNESS));
+        assert!(services.has(ServiceFlags::P2P_V2));
+        assert!(services.has(ServiceFlags::from(NODE_UTREEXO)));
+        assert!(!services.has(ServiceFlags::NETWORK));
+        context.recent_blocks.suspend();
+        assert!(!peer
+            .advertised_services()
+            .has(ServiceFlags::NETWORK_LIMITED));
+        drop(peer);
+        drop(context);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[test]
+    fn getdata_serves_witness_requested_and_only_published_window() {
+        let storage = recent_block_test_storage("getdata-window");
+        let context = test_worker_context(&storage);
+        let blocks = recent_block_chain(&context, 300);
+        context
+            .recent_blocks
+            .set_tip(299, blocks[299].block_hash())
+            .unwrap();
+        let mut peer = Peer::new(context.clone()).unwrap();
+        let unavailable = [
+            Inventory::Block(blocks[10].block_hash()),
+            Inventory::WitnessBlock(BlockHash::from_byte_array([0x77; 32])),
+            Inventory::Transaction(bitcoin::Txid::all_zeros()),
+        ];
+        let mut inventory = vec![
+            Inventory::Block(blocks[299].block_hash()),
+            Inventory::WitnessBlock(blocks[299].block_hash()),
+            Inventory::WitnessBlock(blocks[11].block_hash()),
+        ];
+        inventory.extend(unavailable);
+        peer.handle_get_data(inventory).unwrap();
+        let Some(NetworkMessage::Block(stripped)) = peer.next_get_data_response().unwrap() else {
+            panic!("expected a non-witness block");
+        };
+        assert_eq!(stripped.block_hash(), blocks[299].block_hash());
+        assert!(stripped
+            .txdata
+            .iter()
+            .flat_map(|tx| &tx.input)
+            .all(|input| input.witness.is_empty()));
+        for height in [299, 11] {
+            assert_eq!(
+                peer.next_get_data_response().unwrap(),
+                Some(NetworkMessage::Block(blocks[height].clone()))
+            );
+        }
+        for item in unavailable {
+            assert_eq!(
+                peer.next_get_data_response().unwrap(),
+                Some(NetworkMessage::NotFound(vec![item]))
+            );
+        }
+        context.recent_blocks.suspend();
+        let item = Inventory::WitnessBlock(blocks[299].block_hash());
+        peer.handle_get_data(vec![item]).unwrap();
+        assert_eq!(
+            peer.next_get_data_response().unwrap(),
+            Some(NetworkMessage::NotFound(vec![item]))
+        );
+        drop(peer);
+        drop(context);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    #[test]
+    fn pending_getdata_is_bounded_across_requests_without_materializing_blocks() {
+        let storage = recent_block_test_storage("getdata-bound");
+        let context = test_worker_context(&storage);
+        let blocks = recent_block_chain(&context, 1);
+        context
+            .recent_blocks
+            .set_tip(0, blocks[0].block_hash())
+            .unwrap();
+        let mut peer = Peer::new(context).unwrap();
+        let item = Inventory::WitnessBlock(blocks[0].block_hash());
+        let before = peer.write_buffer.len();
+        peer.handle_get_data(vec![item; MAX_GETDATA_ITEMS as usize / 2])
+            .unwrap();
+        peer.handle_get_data(vec![item; MAX_GETDATA_ITEMS as usize / 2])
+            .unwrap();
+        assert_eq!(peer.write_buffer.len(), before);
+        assert_eq!(peer.pending_inventory.len(), MAX_GETDATA_ITEMS as usize);
+        assert!(matches!(
+            peer.handle_get_data(vec![item]),
+            Err(PeerError::TooManyInventoryItems(_))
+        ));
+        assert_eq!(peer.pending_inventory.len(), MAX_GETDATA_ITEMS as usize);
+        for remaining in (0..MAX_GETDATA_ITEMS as usize).rev() {
+            assert_eq!(
+                peer.next_get_data_response().unwrap(),
+                Some(NetworkMessage::Block(blocks[0].clone()))
+            );
+            assert_eq!(peer.pending_inventory.len(), remaining);
+        }
+        assert!(peer.next_get_data_response().unwrap().is_none());
+        drop(peer);
+        std::fs::remove_dir_all(storage).unwrap();
+    }
+
+    /// Runs the public listener, acceptor, workers, and encrypted transport.
+    /// Server threads live until this explicitly selected smoke-test process exits.
+    #[test]
+    #[ignore = "starts the real P2P server; run explicitly with --ignored"]
+    fn recent_blocks_tcp_bip324_smoke() {
+        let storage = recent_block_test_storage("recent-blocks-smoke");
+        let mut context = test_worker_context(&storage);
+        // Exercise production-sized physical allocation as well as the public listener.
+        context.recent_blocks =
+            Arc::new(RecentBlocks::open(&storage.join("recent-blocks.dat")).unwrap());
+        context.header_source = Some(Arc::new(HeaderSource {
+            headers: header_chain(1),
+            side_hash: BlockHash::all_zeros(),
+        }));
+        let blocks = recent_block_chain(&context, 300);
+        let metadata = std::fs::metadata(storage.join("recent-blocks.dat")).unwrap();
+        println!(
+            "recent ring: file_bytes={} allocated_bytes={}",
+            metadata.len(),
+            std::os::unix::fs::MetadataExt::blocks(&metadata) * 512,
+        );
+        context
+            .recent_blocks
+            .set_tip(299, blocks[299].block_hash())
+            .unwrap();
+        context.proof_index.update_height(299).unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let (_notifier, notifications) = std::sync::mpsc::channel();
+        Node::run(address, context.clone(), notifications).unwrap();
+        let client = std::net::TcpStream::connect(address).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_secs(20)))
+            .unwrap();
+        let reader = BufReader::new(client.try_clone().unwrap());
+        let mut protocol = Protocol::new(
+            Magic::REGTEST.to_bytes(),
+            Role::Initiator,
+            None,
+            None,
+            reader,
+            client,
+        )
+        .unwrap();
+        let address = bitcoin::p2p::address::Address::new(&address, ServiceFlags::NONE);
+        let version = VersionMessage {
+            version: 70016,
+            services: ServiceFlags::WITNESS | ServiceFlags::P2P_V2,
+            timestamp: 0,
+            receiver: address.clone(),
+            sender: address,
+            nonce: 42,
+            user_agent: "/recent-block-smoke/".to_owned(),
+            start_height: 299,
+            relay: false,
+        };
+        protocol
+            .write(&Payload::genuine(
+                V2Codec::encode(&V2Message::Bitcoin(NetworkMessage::Version(version))).unwrap(),
+            ))
+            .unwrap();
+        let response = protocol.read().unwrap();
+        let V2Message::Bitcoin(NetworkMessage::Version(version)) =
+            V2Codec::decode(response.contents()).unwrap()
+        else {
+            panic!("expected server version");
+        };
+        assert!(version.services.has(ServiceFlags::NETWORK_LIMITED));
+        assert!(!version.services.has(ServiceFlags::NETWORK));
+        let response = protocol.read().unwrap();
+        assert_eq!(
+            V2Codec::decode(response.contents()).unwrap(),
+            V2Message::Bitcoin(NetworkMessage::Verack)
+        );
+        let hash = blocks[299].block_hash();
+        let block_payload = V2Codec::encode(&V2Message::Bitcoin(NetworkMessage::Block(
+            blocks[299].clone(),
+        )))
+        .unwrap();
+        assert!(
+            OutboundCipher::encryption_buffer_len(block_payload.len()) * MAX_GETDATA_ITEMS as usize
+                > MAX_WRITE_BUFFER_SIZE
+        );
+        let unavailable = [
+            Inventory::WitnessBlock(blocks[10].block_hash()),
+            Inventory::WitnessBlock(BlockHash::all_zeros()),
+            Inventory::Transaction(bitcoin::Txid::all_zeros()),
+        ];
+        let mut second_batch = vec![
+            Inventory::Block(hash),
+            Inventory::WitnessBlock(blocks[11].block_hash()),
+        ];
+        second_batch.extend(unavailable);
+        // Pipeline requests before reading. Input must pause while the bounded
+        // output drains, including packets already in the decrypted input buffer.
+        for message in [
+            NetworkMessage::GetData(vec![
+                Inventory::WitnessBlock(hash);
+                MAX_GETDATA_ITEMS as usize
+            ]),
+            NetworkMessage::GetData(second_batch),
+            NetworkMessage::Ping(73),
+        ] {
+            protocol
+                .write(&Payload::genuine(
+                    V2Codec::encode(&V2Message::Bitcoin(message)).unwrap(),
+                ))
+                .unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        for _ in 0..MAX_GETDATA_ITEMS {
+            let response = protocol.read().expect("receive backpressured block");
+            assert_eq!(response.contents(), block_payload);
+        }
+        let response = protocol.read().unwrap();
+        assert_eq!(response.contents()[0], 2);
+        let stripped: bitcoin::Block = deserialize(&response.contents()[1..]).unwrap();
+        assert_eq!(stripped.block_hash(), hash);
+        assert!(stripped.txdata[0].input[0].witness.is_empty());
+        let response = protocol.read().unwrap();
+        assert_eq!(response.contents()[0], 2);
+        assert_eq!(
+            deserialize::<bitcoin::Block>(&response.contents()[1..]).unwrap(),
+            blocks[11]
+        );
+        for item in unavailable {
+            let response = protocol.read().unwrap();
+            assert_eq!(response.contents()[0], 17);
+            assert_eq!(
+                deserialize::<Vec<Inventory>>(&response.contents()[1..]).unwrap(),
+                vec![item]
+            );
+        }
+        let response = protocol.read().unwrap();
+        assert_eq!(response.contents()[0], 19);
+        assert_eq!(deserialize::<u64>(&response.contents()[1..]).unwrap(), 73);
+        println!("BIP324: served 1024 pipelined blocks, stripped witnesses, enforced the window, and answered ping");
+        drop(protocol);
+        drop(context);
+        std::fs::remove_dir_all(storage).unwrap();
     }
 
     #[test]
@@ -2694,15 +3070,10 @@ mod tests {
             headers: header_chain(12),
             side_hash: BlockHash::all_zeros(),
         }));
-        let services = Peer::advertised_services();
-        assert!(services.has(ServiceFlags::P2P_V2));
-        assert!(services.has(ServiceFlags::WITNESS));
-        assert!(services.has(ServiceFlags::from(1 << 12)));
-        assert!(!services.has(ServiceFlags::from(1 << 24)));
-        assert!(!services.has(ServiceFlags::NETWORK));
-        assert!(!services.has(ServiceFlags::NETWORK_LIMITED));
         let block = bitcoin::constants::genesis_block(bitcoin::Network::Signet);
         let block_hash = block.block_hash();
+        context.recent_blocks.put(0, &block).unwrap();
+        context.recent_blocks.set_tip(0, block_hash).unwrap();
         let proof_hashes: Vec<_> = (0..11)
             .map(|index| BlockHash::from_byte_array([index; 32]))
             .collect();
@@ -2923,10 +3294,10 @@ mod tests {
             .contents()
             .split_first()
             .expect("block response short ID");
-        assert_eq!(*short_id, 17);
+        assert_eq!(*short_id, 2);
         assert_eq!(
-            deserialize::<Vec<Inventory>>(payload).expect("decode notfound"),
-            vec![Inventory::WitnessBlock(block_hash)]
+            deserialize::<bitcoin::Block>(payload).expect("decode retained block"),
+            block
         );
 
         drop(protocol);

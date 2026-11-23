@@ -15,6 +15,7 @@ mod node;
 mod parallel_forest;
 mod position_timing;
 mod prover;
+mod recent_blocks;
 
 mod block_index;
 mod chaininterface;
