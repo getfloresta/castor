@@ -55,6 +55,8 @@ use crate::parallel_forest::ForestView;
 use crate::parallel_forest::SteadyStateForest;
 use crate::position_timing::PositionTimer;
 use crate::position_timing::PositionTiming;
+use crate::recent_blocks::RecentBlocks;
+use crate::recent_blocks::RETAINED_BLOCKS;
 use crate::udata::bitcoin_leaf_data::get_leaf_hash_from_parts;
 use crate::udata::BatchProof;
 use crate::udata::CompactBlockProof;
@@ -124,6 +126,7 @@ struct PersistenceBlock {
     header: bitcoin::block::Header,
     proof: Arc<CompactBlockProof>,
     proof_forest_rows: u8,
+    retained_block: Option<Block>,
 }
 
 enum PersistenceCommand {
@@ -156,6 +159,7 @@ struct PersistenceState {
     proof_file: Arc<ProofFile>,
     proof_index: Arc<BlocksIndex>,
     header_index: Arc<HeaderIndex>,
+    recent_blocks: Arc<RecentBlocks>,
     block_notification: Sender<BlockHash>,
     height: u32,
     tip_hash: BlockHash,
@@ -207,6 +211,16 @@ impl PersistenceState {
         }
         self.proof_file.sync()?;
         timings.proof_store = started.elapsed();
+        // Reserve and overwrite ring slots before publishing the serving tip.
+        // Historical catch-up batches deliberately do not carry block bodies.
+        for block in blocks {
+            if let Some(body) = &block.retained_block {
+                self.recent_blocks.put(block.entry.height, body)?;
+            }
+        }
+        if blocks.iter().any(|block| block.retained_block.is_some()) {
+            self.recent_blocks.sync()?;
+        }
         let started = Instant::now();
         for block in blocks {
             self.header_index.put(block.entry.height, &block.header)?;
@@ -244,6 +258,9 @@ impl PersistenceState {
         timings.height_commit = started.elapsed();
         self.height = last.entry.height;
         self.tip_hash = last.entry.block_hash;
+        if blocks.iter().any(|block| block.retained_block.is_some()) {
+            self.recent_blocks.set_tip(self.height, self.tip_hash)?;
+        }
         let prune = self.journal.lock().prepare_prune(144)?;
         if let Some(prune) = prune {
             if let Err(error) = prune.finish() {
@@ -266,6 +283,7 @@ impl PersistenceState {
     }
 
     fn finish_failed(&self, mut error: anyhow::Error) -> anyhow::Error {
+        self.recent_blocks.suspend();
         // Runtime database allocators retain their current page and bucket heads in
         // memory until sync. Seal them before an orderly failed worker exits so the
         // durable journal can be replayed on reopen. This does not commit a height
@@ -574,6 +592,8 @@ struct PreparedBlock {
 pub struct FlatFileProver {
     rpc: Arc<dyn Blockchain>,
     header_index: Arc<HeaderIndex>,
+    recent_blocks: Arc<RecentBlocks>,
+    retain_blocks: bool,
     persistence: PersistenceWorker,
     acc: Arc<RwLock<SteadyStateForest>>,
     journal: Arc<Mutex<ForestJournal>>,
@@ -720,6 +740,7 @@ impl FlatFileProver {
         leaf_map_path: &Path,
         proof_file: Arc<ProofFile>,
         proof_index: Arc<BlocksIndex>,
+        recent_blocks: Arc<RecentBlocks>,
         bootstrap_height: u32,
         lock_pages: bool,
         pollard_memory_limit: usize,
@@ -861,6 +882,7 @@ impl FlatFileProver {
             proof_file,
             proof_index,
             header_index: Arc::clone(&header_index),
+            recent_blocks: Arc::clone(&recent_blocks),
             block_notification,
             height,
             tip_hash,
@@ -871,6 +893,8 @@ impl FlatFileProver {
         Ok(Self {
             rpc,
             header_index,
+            recent_blocks,
+            retain_blocks: false,
             persistence,
             acc,
             journal,
@@ -1074,6 +1098,7 @@ impl FlatFileProver {
                 break;
             }
             self.drain_pending_apply()?;
+            self.recent_blocks.suspend();
             if !self.publication_window.is_empty() {
                 let discarded = self.publication_window.len() as u32;
                 let tip = self
@@ -1112,6 +1137,9 @@ impl FlatFileProver {
                 tip.leaves
             );
         }
+        if rolled_back != 0 && self.retain_blocks {
+            self.recent_blocks.set_tip(self.height, self.tip_hash)?;
+        }
         Ok(rolled_back)
     }
 
@@ -1119,11 +1147,52 @@ impl FlatFileProver {
         self.reconcile_chain()?;
         let tip = self.rpc.get_block_count()? as u32;
         let start = self.height.saturating_add(1);
-        if start > tip {
-            return Ok(0);
+        let processed = if start <= tip {
+            self.prove_range(start, tip)?;
+            self.height.saturating_sub(start - 1)
+        } else {
+            0
+        };
+        if !self.shutdown_flag.load(Ordering::Acquire)
+            && self.height == self.rpc.get_block_count()? as u32
+            && self.tip_hash == self.rpc.get_block_hash(self.height as u64)?
+        {
+            self.populate_recent_blocks()?;
         }
-        self.prove_range(start, tip)?;
-        Ok(tip - start + 1)
+        Ok(processed)
+    }
+
+    fn populate_recent_blocks(&mut self) -> anyhow::Result<()> {
+        if self.retain_blocks && self.recent_blocks.is_ready() {
+            return Ok(());
+        }
+        self.recent_blocks.suspend();
+        self.sync()?;
+        let start = self.height.saturating_sub(RETAINED_BLOCKS - 1);
+        for height in start..=self.height {
+            if self.shutdown_flag.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            let hash = self.rpc.get_block_hash(height as u64)?;
+            if !self.recent_blocks.contains(height, hash) {
+                let block = self.rpc.get_block(hash)?;
+                anyhow::ensure!(block.block_hash() == hash, "recent block hash mismatch");
+                self.recent_blocks.put(height, &block)?;
+            }
+        }
+        self.recent_blocks.sync()?;
+        // RPC may have reorganized during backfill. Do not advertise that window.
+        if self.rpc.get_block_hash(self.height as u64)? != self.tip_hash {
+            return Ok(());
+        }
+        self.recent_blocks.set_tip(self.height, self.tip_hash)?;
+        anyhow::ensure!(
+            self.recent_blocks.is_ready(),
+            "recent block window is incomplete"
+        );
+        self.retain_blocks = true;
+        info!("Recent block window ready at height={}", self.height);
+        Ok(())
     }
 
     pub fn prove_range(&mut self, start: u32, end: u32) -> anyhow::Result<()> {
@@ -1200,6 +1269,7 @@ impl FlatFileProver {
                 header: block.header,
                 proof,
                 proof_forest_rows: pending.proof_forest_rows,
+                retained_block: self.retain_blocks.then_some(block),
             });
             self.overlay.push(&entry);
             self.pending_apply.push_back(PendingApply { entry });
@@ -2049,6 +2119,7 @@ mod tests {
                 &self.root.join("leaf-map"),
                 proof_file.clone(),
                 proof_index.clone(),
+                Arc::new(RecentBlocks::open_test(&self.root.join("recent-blocks")).unwrap()),
                 1,
                 false,
                 1 << 20,
@@ -2473,6 +2544,80 @@ mod tests {
             .get_index(fixture.chain.get_block_hash(100).unwrap())
             .unwrap()
             .is_some());
+        reopened.sync_for_shutdown().unwrap();
+    }
+
+    #[test]
+    fn recent_blocks_activate_after_catchup_and_replace_reorgs() {
+        let fixture = PersistenceFixture::new();
+        let (mut prover, proofs, index, _) = fixture.open();
+        let ring = Arc::clone(&prover.recent_blocks);
+        assert!(!ring.is_ready());
+        prover.prove_range(2, 10).unwrap();
+        assert!(!ring.is_ready());
+        assert_eq!(
+            std::fs::metadata(fixture.root.join("recent-blocks"))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(prover.sync_to_tip().unwrap(), 210);
+        assert!(ring.is_ready());
+        let original = fixture.chain.blocks.lock().clone();
+        assert_eq!(
+            ring.get(original[220].block_hash()).unwrap(),
+            Some(original[220].clone())
+        );
+        assert_eq!(
+            ring.get(original[0].block_hash()).unwrap(),
+            Some(original[0].clone())
+        );
+        let allocated = std::fs::metadata(fixture.root.join("recent-blocks"))
+            .unwrap()
+            .len();
+
+        fixture.chain.blocks.lock().truncate(218);
+        prover.sync_to_tip().unwrap();
+        assert!(ring.is_ready());
+        for block in &original[218..] {
+            assert!(ring.get(block.block_hash()).unwrap().is_none());
+        }
+        let mut previous = original[217].block_hash();
+        for old in &original[218..] {
+            let mut replacement = old.clone();
+            replacement.header.prev_blockhash = previous;
+            replacement.header.nonce = replacement.header.nonce.wrapping_add(1);
+            previous = replacement.block_hash();
+            fixture.chain.blocks.lock().push(replacement);
+        }
+        assert_eq!(prover.sync_to_tip().unwrap(), 3);
+        assert!(ring.is_ready());
+        assert_eq!(
+            ring.get(previous).unwrap(),
+            fixture.chain.blocks.lock().last().cloned()
+        );
+        for block in &original[218..] {
+            assert!(ring.get(block.block_hash()).unwrap().is_none());
+        }
+        assert_eq!(
+            std::fs::metadata(fixture.root.join("recent-blocks"))
+                .unwrap()
+                .len(),
+            allocated
+        );
+        prover.sync_for_shutdown().unwrap();
+        drop(prover);
+        drop(proofs);
+        drop(index);
+        drop(ring);
+        let (mut reopened, _, _, _) = fixture.open();
+        assert!(!reopened.recent_blocks.is_ready());
+        assert_eq!(reopened.sync_to_tip().unwrap(), 0);
+        assert!(reopened.recent_blocks.is_ready());
+        assert_eq!(
+            reopened.recent_blocks.get(previous).unwrap(),
+            fixture.chain.blocks.lock().last().cloned()
+        );
         reopened.sync_for_shutdown().unwrap();
     }
 

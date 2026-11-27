@@ -953,7 +953,6 @@ impl KernelBlockSource {
             Network::Testnet4 => bitcoin_data_dir.join("testnet4"),
             Network::Signet => bitcoin_data_dir.join("signet"),
             Network::Regtest => bitcoin_data_dir.join("regtest"),
-            _ => bail!("unsupported Bitcoin network {network}"),
         };
         let blocks_dir = network_data_dir.join("blocks");
         if !blocks_dir.is_dir() {
@@ -968,7 +967,6 @@ impl KernelBlockSource {
             Network::Testnet4 => ChainType::Testnet4,
             Network::Signet => ChainType::Signet,
             Network::Regtest => ChainType::Regtest,
-            _ => bail!("unsupported Bitcoin network {network}"),
         };
         let context = ContextBuilder::new()
             .chain_type(chain_type)
@@ -1427,6 +1425,7 @@ impl SteadyStateForest {
     pub fn leaves(&self) -> u64 {
         self.leaves
     }
+    #[cfg(test)]
     pub(crate) fn forest_rows(&self) -> u8 {
         self.forest_rows
     }
