@@ -19,9 +19,11 @@
 //! ignored without invoking their potentially allocation-heavy Bitcoin
 //! decoders.
 //!
-//! Proof requests read compact-only records through [`ProofBackend`]. Recent
-//! canonical blocks come from the bounded [`RecentBlocks`] ring; older or
-//! unavailable blocks receive `notfound`. Headers use local indexes or RPC.
+//! Proof requests read separate proof and compact-leaf records through
+//! [`ProofBackend`], allowing historical leaf-only requests without a retained
+//! proof. Unavailable requested data receives `notfound` for the block hash.
+//! Recent canonical blocks come from the bounded [`RecentBlocks`] ring; older
+//! or unavailable blocks receive `notfound`. Headers use local indexes or RPC.
 //!
 //! # Admission and failure isolation
 //!
@@ -96,14 +98,14 @@ use mio::Interest;
 use mio::Token;
 use self_cell::self_cell;
 
-use crate::block_index::BlockIndex;
 use crate::block_index::BlocksIndex;
+use crate::blockfile::LeafFile;
 use crate::blockfile::ProofFile;
 use crate::chaininterface::Blockchain;
 use crate::chainview::ChainView;
 use crate::header_index::HeaderIndex;
 use crate::recent_blocks::RecentBlocks;
-use crate::udata::CompactBlockProof;
+use crate::udata::BatchProof;
 use crate::udata::CompactLeafData;
 
 /// Deprecated Utreexo compact-filter type retained for compatibility.
@@ -114,7 +116,7 @@ const MAX_PEERS: usize = 64;
 /// Maximum number of addresses retained in the temporary ban table.
 const MAX_BANNED_PEERS: usize = 4_096;
 /// Number of authenticated packets a peer may send in one rate-limit window.
-const MAX_MESSAGES_PER_SECOND: u32 = 100;
+const MAX_MESSAGES_PER_SECOND: u32 = 10_000;
 const RATE_LIMIT_VIOLATIONS: u8 = 3;
 const EVENT_CAPACITY: usize = 1_024;
 /// Maximum accepts handled before returning to block broadcasts and polling.
@@ -461,16 +463,11 @@ impl MessageRateLimiter {
 /// Storage used to answer BIP 183 proof requests.
 #[derive(Clone)]
 pub enum ProofBackend {
-    /// Compact proof records retained after the hintsfile boundary.
-    CompactProofs(Arc<ProofFile>),
-}
-
-impl ProofBackend {
-    fn get(&self, index: BlockIndex) -> Option<CompactBlockProof> {
-        match self {
-            Self::CompactProofs(proofs) => proofs.get(&index),
-        }
-    }
+    /// Proof records and independently retained compact undo leaves.
+    CompactProofs {
+        proofs: Arc<ProofFile>,
+        leaves: Arc<LeafFile>,
+    },
 }
 
 /// Data required by peers to answer requests.
@@ -1645,31 +1642,56 @@ impl Peer {
             return Err(PeerError::ProofBitmapTooLarge);
         }
         let Some(index) = self.context.proof_index.get_index(request.block_hash)? else {
-            return Ok(());
+            return self.send_proof_not_found(request.block_hash);
         };
-        let Some(stored_proof) = self.context.proof_backend.get(index) else {
-            return Ok(());
+        let ProofBackend::CompactProofs { proofs, leaves } = &self.context.proof_backend;
+        let needs_proof =
+            request.request_mask & (GetUtreexoProof::TARGETS | GetUtreexoProof::PROOF_HASHES) != 0
+                || request.proof_bitmap.iter().any(|byte| *byte != 0);
+        let needs_leaves = request.request_mask & GetUtreexoProof::LEAF_DATA != 0
+            || request.leaf_bitmap.iter().any(|byte| *byte != 0);
+        let stored_proof = if needs_proof {
+            let Some(proof) = index.proof.and_then(|index| proofs.get(&index.file)) else {
+                return self.send_proof_not_found(request.block_hash);
+            };
+            proof
+        } else {
+            BatchProof::default()
+        };
+        let stored_leaves = if needs_leaves {
+            let Some(leaves) = leaves.get(&index.leaf_data) else {
+                return self.send_proof_not_found(request.block_hash);
+            };
+            leaves
+        } else {
+            Vec::new()
         };
         let proof = UtreexoProof {
             block_hash: request.block_hash,
             proof_hashes: if request.request_mask & GetUtreexoProof::PROOF_HASHES != 0 {
-                stored_proof.proof.hashes
+                stored_proof.hashes
             } else {
-                Self::select_bitmap(&stored_proof.proof.hashes, &request.proof_bitmap)
+                Self::select_bitmap(&stored_proof.hashes, &request.proof_bitmap)
             },
             target_locations: if request.request_mask & GetUtreexoProof::TARGETS != 0 {
-                stored_proof.proof.targets
+                stored_proof.targets
             } else {
                 Vec::new()
             },
             leaf_data: if request.request_mask & GetUtreexoProof::LEAF_DATA != 0 {
-                stored_proof.leaves
+                stored_leaves
             } else {
-                Self::select_bitmap(&stored_proof.leaves, &request.leaf_bitmap)
+                Self::select_bitmap(&stored_leaves, &request.leaf_bitmap)
             },
         };
         let payload = V2Codec::encode(&V2Message::UtreexoProof(proof))?;
         self.send_payload(&payload)
+    }
+
+    fn send_proof_not_found(&mut self, block_hash: BlockHash) -> Result<(), PeerError> {
+        // BIP 183 defines no block-proof inventory type: 6 denotes transaction
+        // proof positions, and 29 is a P2PV2 message ID, not an inventory type.
+        self.send_message(NetworkMessage::NotFound(vec![Inventory::Block(block_hash)]))
     }
 
     fn select_bitmap<T: Clone>(values: &[T], bitmap: &[u8]) -> Vec<T> {
@@ -1750,7 +1772,7 @@ fn headers_for_request(
     )?;
     let start = common_height.saturating_add(1);
     let end = match header_source {
-        Some(source) => u32::try_from(source.get_block_count()?)
+        Some(source) => u32::try_from(source.get_block_count().map_err(PeerError::Rpc)?)
             .unwrap_or(u32::MAX)
             .saturating_add(1)
             .min(start.saturating_add(MAX_HEADERS as u32))
@@ -1809,7 +1831,9 @@ fn active_locator_height(
             continue;
         };
         if active_hash == *block_hash {
-            let header = source.get_block_header(*block_hash)?;
+            let header = source
+                .get_block_header(*block_hash)
+                .map_err(PeerError::Rpc)?;
             if let Some(index) = header_index {
                 index.put(height, &header)?;
             }
@@ -1840,8 +1864,12 @@ fn header_at_height(
     let Some(source) = header_source else {
         return Ok(None);
     };
-    let block_hash = source.get_block_hash(height as u64)?;
-    let header = source.get_block_header(block_hash)?;
+    let block_hash = source
+        .get_block_hash(height as u64)
+        .map_err(PeerError::Rpc)?;
+    let header = source
+        .get_block_header(block_hash)
+        .map_err(PeerError::Rpc)?;
     if let Some(index) = header_index {
         index.put(height, &header)?;
     }
@@ -2214,7 +2242,7 @@ enum PeerError {
     RateLimitExceeded,
     RecentBlocks(anyhow::Error),
     Rpc(anyhow::Error),
-    Storage(kv::Error),
+    Storage(anyhow::Error),
     TooManyInventoryItems(u64),
     TooManyLocatorHashes(u64),
     TooManyHandshakePackets(usize),
@@ -2304,12 +2332,6 @@ impl From<std::io::Error> for PeerError {
 
 impl From<anyhow::Error> for PeerError {
     fn from(error: anyhow::Error) -> Self {
-        Self::Rpc(error)
-    }
-}
-
-impl From<kv::Error> for PeerError {
-    fn from(error: kv::Error) -> Self {
         Self::Storage(error)
     }
 }
@@ -2323,7 +2345,9 @@ mod tests {
     use bip324::io::Payload;
     use bip324::io::Protocol;
 
-    use crate::udata::BatchProof;
+    use crate::block_index::BlockIndex;
+    use crate::block_index::FileIndex;
+    use crate::block_index::ProofIndex;
     use crate::udata::ScriptPubkeyType;
 
     use super::*;
@@ -2673,29 +2697,25 @@ mod tests {
 
     fn test_worker_context(root: &Path) -> WorkerContext {
         std::fs::create_dir_all(root).expect("create test storage");
-        let store = |name: &str| {
-            kv::Store::new(kv::Config {
-                path: root.join(name),
-                temporary: false,
-                use_compression: false,
-                flush_every_ms: None,
-                cache_capacity: None,
-                segment_size: None,
-            })
-            .expect("open test database")
-        };
         WorkerContext {
-            proof_backend: ProofBackend::CompactProofs(Arc::new(
-                ProofFile::new(root.join("proofs.dat")).expect("open test proof file"),
-            )),
-            proof_index: Arc::new(BlocksIndex {
-                database: store("index"),
-            }),
+            proof_backend: ProofBackend::CompactProofs {
+                proofs: Arc::new(
+                    ProofFile::new(root.join("proofs.dat")).expect("open test proof file"),
+                ),
+                leaves: Arc::new(
+                    LeafFile::new(root.join("leaves.dat")).expect("open test leaf file"),
+                ),
+            },
+            proof_index: Arc::new(
+                BlocksIndex::open(&root.join("index")).expect("open test proof index"),
+            ),
             recent_blocks: Arc::new(
                 RecentBlocks::open_test(&root.join("recent-blocks.dat"))
                     .expect("open test recent blocks"),
             ),
-            chainview: Arc::new(ChainView::new(store("chainview"))),
+            chainview: Arc::new(
+                ChainView::open(&root.join("chainview")).expect("open test chain view"),
+            ),
             header_index: None,
             header_source: None,
             magic: Magic::REGTEST,
@@ -3051,11 +3071,11 @@ mod tests {
 
     #[test]
     fn slow_and_malformed_peers_do_not_block_compact_bip183_proof_service() {
-        exercise_proof_service(None);
-        exercise_proof_service(Some(27));
+        exercise_proof_service(63);
+        exercise_proof_service(27);
     }
 
-    fn exercise_proof_service(entry_forest_rows: Option<u8>) {
+    fn exercise_proof_service(entry_forest_rows: u8) {
         let storage = std::env::temp_dir().join(format!(
             "bridge-worker-test-{}-{}",
             std::process::id(),
@@ -3095,20 +3115,66 @@ mod tests {
                 ..leaf.clone()
             })
             .collect();
-        let stored_proof = CompactBlockProof {
-            proof: BatchProof {
-                targets: vec![VarInt(9223372036921654703); 11],
-                hashes: proof_hashes.clone(),
-            },
-            leaves: leaves.clone(),
+        let stored_proof = BatchProof {
+            targets: vec![VarInt(9223372036921654703); 11],
+            hashes: proof_hashes.clone(),
         };
-        let ProofBackend::CompactProofs(proofs) = &context.proof_backend;
-        let mut index = proofs.append(&stored_proof).expect("append compact proof");
-        index.proof_forest_rows = entry_forest_rows;
+        let ProofBackend::CompactProofs {
+            proofs,
+            leaves: leaf_file,
+        } = &context.proof_backend;
+        let index = BlockIndex {
+            leaf_data: leaf_file.append(&leaves).expect("append compact leaves"),
+            proof: Some(ProofIndex {
+                file: proofs.append(&stored_proof).expect("append compact proof"),
+                forest_rows: entry_forest_rows,
+            }),
+        };
         context
             .proof_index
             .append(index, block_hash)
             .expect("index compact proof");
+        let historical_hash = BlockHash::from_byte_array([0xa1; 32]);
+        let missing_proof_hash = BlockHash::from_byte_array([0xa2; 32]);
+        let missing_leaves_hash = BlockHash::from_byte_array([0xa3; 32]);
+        let unknown_hash = BlockHash::from_byte_array([0xa4; 32]);
+        let missing_file = FileIndex {
+            offset: 1_000_000,
+            size: 1,
+        };
+        context
+            .proof_index
+            .append(
+                BlockIndex {
+                    proof: None,
+                    ..index
+                },
+                historical_hash,
+            )
+            .unwrap();
+        context
+            .proof_index
+            .append(
+                BlockIndex {
+                    proof: Some(ProofIndex {
+                        file: missing_file,
+                        forest_rows: entry_forest_rows,
+                    }),
+                    ..index
+                },
+                missing_proof_hash,
+            )
+            .unwrap();
+        context
+            .proof_index
+            .append(
+                BlockIndex {
+                    leaf_data: missing_file,
+                    ..index
+                },
+                missing_leaves_hash,
+            )
+            .unwrap();
         let expected_proof = UtreexoProof {
             block_hash,
             proof_hashes,
@@ -3280,6 +3346,99 @@ mod tests {
                         .to_vec()
                 }
             );
+        }
+
+        // Historical undo leaves do not require proof storage. A zero-filled
+        // proof bitmap also must not make a leaf-only request depend on it.
+        for hash in [historical_hash, missing_proof_hash] {
+            for mask in [0, GetUtreexoProof::LEAF_DATA] {
+                let request = GetUtreexoProof {
+                    block_hash: hash,
+                    request_mask: mask,
+                    proof_bitmap: vec![0, 0],
+                    leaf_bitmap: vec![0x85, 0x01],
+                };
+                let payload = V2Codec::encode(&V2Message::GetUtreexoProof(request)).unwrap();
+                protocol.write(&Payload::genuine(payload)).unwrap();
+                let response = protocol.read().expect("receive historical leaves");
+                assert_eq!(response.contents()[0], 29);
+                let proof: UtreexoProof = deserialize(&response.contents()[1..]).unwrap();
+                assert_eq!(proof.block_hash, hash);
+                assert!(proof.proof_hashes.is_empty());
+                assert!(proof.target_locations.is_empty());
+                assert_eq!(
+                    proof.leaf_data,
+                    if mask & GetUtreexoProof::LEAF_DATA != 0 {
+                        expected_proof.leaf_data.clone()
+                    } else {
+                        [0, 2, 7, 8]
+                            .map(|i| expected_proof.leaf_data[i].clone())
+                            .to_vec()
+                    }
+                );
+            }
+        }
+
+        // Conversely, targets/hashes must not read unrequested leaf storage.
+        let request = GetUtreexoProof {
+            block_hash: missing_leaves_hash,
+            request_mask: GetUtreexoProof::TARGETS | GetUtreexoProof::PROOF_HASHES,
+            proof_bitmap: Vec::new(),
+            leaf_bitmap: vec![0, 0],
+        };
+        let payload = V2Codec::encode(&V2Message::GetUtreexoProof(request)).unwrap();
+        protocol.write(&Payload::genuine(payload)).unwrap();
+        let response = protocol.read().expect("receive proof without leaves");
+        assert_eq!(response.contents()[0], 29);
+        let proof: UtreexoProof = deserialize(&response.contents()[1..]).unwrap();
+        assert_eq!(proof.block_hash, missing_leaves_hash);
+        assert_eq!(proof.target_locations, expected_proof.target_locations);
+        assert_eq!(proof.proof_hashes, expected_proof.proof_hashes);
+        assert!(proof.leaf_data.is_empty());
+
+        // Neither an absent proof index nor an unreadable proof record may
+        // masquerade as an empty valid proof, including bitmap-only requests.
+        for hash in [historical_hash, missing_proof_hash, unknown_hash] {
+            for (mask, bitmap) in [
+                (GetUtreexoProof::TARGETS, vec![]),
+                (GetUtreexoProof::PROOF_HASHES, vec![]),
+                (0, vec![0, 0x04]),
+                (GetUtreexoProof::LEAF_DATA, vec![1]),
+                (7, vec![]),
+            ] {
+                let request = GetUtreexoProof {
+                    block_hash: hash,
+                    request_mask: mask,
+                    proof_bitmap: bitmap,
+                    leaf_bitmap: Vec::new(),
+                };
+                let payload = V2Codec::encode(&V2Message::GetUtreexoProof(request)).unwrap();
+                protocol.write(&Payload::genuine(payload)).unwrap();
+                let response = protocol.read().expect("receive missing proof response");
+                assert_eq!(response.contents()[0], 17);
+                assert_eq!(
+                    deserialize::<Vec<Inventory>>(&response.contents()[1..]).unwrap(),
+                    vec![Inventory::Block(hash)]
+                );
+            }
+        }
+        for hash in [missing_leaves_hash, unknown_hash] {
+            for (mask, bitmap) in [(GetUtreexoProof::LEAF_DATA, vec![]), (0, vec![0, 0x01])] {
+                let request = GetUtreexoProof {
+                    block_hash: hash,
+                    request_mask: mask,
+                    proof_bitmap: Vec::new(),
+                    leaf_bitmap: bitmap,
+                };
+                let payload = V2Codec::encode(&V2Message::GetUtreexoProof(request)).unwrap();
+                protocol.write(&Payload::genuine(payload)).unwrap();
+                let response = protocol.read().expect("receive missing leaves response");
+                assert_eq!(response.contents()[0], 17);
+                assert_eq!(
+                    deserialize::<Vec<Inventory>>(&response.contents()[1..]).unwrap(),
+                    vec![Inventory::Block(hash)]
+                );
+            }
         }
 
         let request = V2Codec::encode(&V2Message::Bitcoin(NetworkMessage::GetData(vec![

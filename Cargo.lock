@@ -312,7 +312,6 @@ dependencies = [
  "hex",
  "hintsfile",
  "jemallocator",
- "kv",
  "libc",
  "log",
  "memmap2",
@@ -333,12 +332,6 @@ name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72f5acc6cb2ba439de613abc23857ec3d78374d8ed5ac84e9d11336e87da8649"
-
-[[package]]
-name = "byteorder"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "bytes"
@@ -449,15 +442,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
 dependencies = [
  "libc",
-]
-
-[[package]]
-name = "crc32fast"
-version = "1.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01a7799fd6b852db0e61728dde9a204c423b44d689dbd432522543614b490e78"
-dependencies = [
- "cfg-if",
 ]
 
 [[package]]
@@ -610,16 +594,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fs2"
-version = "0.4.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
-dependencies = [
- "libc",
- "winapi",
-]
-
-[[package]]
 name = "futures-channel"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -664,15 +638,6 @@ dependencies = [
  "memchr",
  "pin-project-lite",
  "slab",
-]
-
-[[package]]
-name = "fxhash"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c31b6d751ae2c7f11320402d34e41349dd1016f8d5d45e48c4312bc8625af50c"
-dependencies = [
- "byteorder",
 ]
 
 [[package]]
@@ -1047,19 +1012,6 @@ dependencies = [
  "minreq",
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "kv"
-version = "0.24.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "620727085ac39ee9650b373fe6d8073a0aee6f99e52a9c72b25f7671078039ab"
-dependencies = [
- "pin-project-lite",
- "serde",
- "sled",
- "thiserror",
- "toml",
 ]
 
 [[package]]
@@ -1595,22 +1547,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
-name = "sled"
-version = "0.34.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7f96b4737c2ce5987354855aed3797279def4ebf734436c6aa4552cf8e169935"
-dependencies = [
- "crc32fast",
- "crossbeam-epoch",
- "crossbeam-utils",
- "fs2",
- "fxhash",
- "libc",
- "log",
- "parking_lot",
-]
-
-[[package]]
 name = "smallvec"
 version = "1.16.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1718,26 +1654,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
-]
-
-[[package]]
 name = "time"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1815,15 +1731,6 @@ dependencies = [
  "libc",
  "pin-project-lite",
  "tokio",
-]
-
-[[package]]
-name = "toml"
-version = "0.5.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234"
-dependencies = [
- "serde",
 ]
 
 [[package]]

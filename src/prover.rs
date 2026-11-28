@@ -38,7 +38,10 @@ use rustreexo::pollard::PollardAddition;
 use rustreexo::proof::Proof;
 use rustreexo::stump::Stump;
 
+use crate::block_index::BlockIndex;
 use crate::block_index::BlocksIndex;
+use crate::block_index::ProofIndex;
+use crate::blockfile::LeafFile;
 use crate::blockfile::ProofFile;
 use crate::chaininterface::Blockchain;
 use crate::chaininterface::PrevoutInfo;
@@ -157,6 +160,7 @@ struct PersistenceState {
     journal: Arc<Mutex<ForestJournal>>,
     publisher: JournalPublisher,
     proof_file: Arc<ProofFile>,
+    leaf_file: Arc<LeafFile>,
     proof_index: Arc<BlocksIndex>,
     header_index: Arc<HeaderIndex>,
     recent_blocks: Arc<RecentBlocks>,
@@ -199,17 +203,33 @@ impl PersistenceState {
         let started = Instant::now();
         let mut indexes = Vec::with_capacity(blocks.len());
         for block in blocks {
-            let mut index = self.proof_file.append(&block.proof)?;
-            if self.proof_file.get(&index).as_ref() != Some(block.proof.as_ref()) {
+            let file = self.proof_file.append(&block.proof.proof)?;
+            let leaf_data = match self.proof_index.get_index(block.entry.block_hash)? {
+                Some(index)
+                    if self.leaf_file.get(&index.leaf_data).as_ref()
+                        == Some(&block.proof.leaves) =>
+                {
+                    index.leaf_data
+                }
+                _ => self.leaf_file.append(&block.proof.leaves)?,
+            };
+            if self.proof_file.get(&file).as_ref() != Some(&block.proof.proof) {
                 anyhow::bail!(
                     "failed to read back compact proof for {}",
                     block.entry.block_hash
                 );
             }
-            index.proof_forest_rows = Some(block.proof_forest_rows);
+            let index = BlockIndex {
+                leaf_data,
+                proof: Some(ProofIndex {
+                    file,
+                    forest_rows: block.proof_forest_rows,
+                }),
+            };
             indexes.push((index, block.entry.block_hash));
         }
         self.proof_file.sync()?;
+        self.leaf_file.sync()?;
         timings.proof_store = started.elapsed();
         // Reserve and overwrite ring slots before publishing the serving tip.
         // Historical catch-up batches deliberately do not carry block bodies.
@@ -321,6 +341,7 @@ impl PersistenceState {
                     .sync()?;
                 self.journal.lock().flush()?;
                 self.proof_file.sync()?;
+                self.leaf_file.sync()?;
                 self.header_index.sync()?;
                 self.proof_index.update_height(self.height as usize)?;
             }
@@ -364,13 +385,16 @@ impl PersistenceState {
                 }
                 self.header_index.remove(height, hash)?;
                 self.header_index.sync()?;
-                self.proof_index.remove(hash)?;
+                self.proof_index.remove_proof(hash)?;
                 let previous_height = height.saturating_sub(1);
                 let previous_index = if previous_height > self.bootstrap_height {
                     Some(
                         self.proof_index
                             .get_index(entry.previous_block_hash)?
-                            .context("proof index is missing rollback destination")?,
+                            .context("proof index is missing rollback destination")?
+                            .proof
+                            .context("rollback destination has no proof")?
+                            .file,
                     )
                 } else {
                     None
@@ -617,6 +641,7 @@ fn recoverable_journal_height(
     header_index: &HeaderIndex,
     proof_index: &BlocksIndex,
     proof_file: &ProofFile,
+    leaf_file: &LeafFile,
     indexed_height: u32,
     bootstrap_height: u32,
 ) -> anyhow::Result<u32> {
@@ -638,19 +663,35 @@ fn recoverable_journal_height(
         }
         let index = proof_index.get_index(record.entry.block_hash)?;
         let valid = index.as_ref().is_some_and(|index| {
-            index.proof_forest_rows == Some(replay.proof_forest_rows)
-                && proof_file.get(index).as_ref() == Some(replay.proof.as_ref())
+            index.proof.is_some_and(|proof| {
+                proof.forest_rows == replay.proof_forest_rows
+                    && proof_file.get(&proof.file).as_ref() == Some(&replay.proof.proof)
+            }) && leaf_file.get(&index.leaf_data).as_ref() == Some(&replay.proof.leaves)
         });
         if repair_proof_tail || !valid {
             // Keep repaired indexes in file order: truncating at the recovered
             // tip must not discard a repaired earlier proof appended after it.
             repair_proof_tail = true;
-            let mut index = proof_file.append(&replay.proof)?;
-            index.proof_forest_rows = Some(replay.proof_forest_rows);
+            let leaf_data = match index {
+                Some(index)
+                    if leaf_file.get(&index.leaf_data).as_ref() == Some(&replay.proof.leaves) =>
+                {
+                    index.leaf_data
+                }
+                _ => leaf_file.append(&replay.proof.leaves)?,
+            };
+            let index = BlockIndex {
+                leaf_data,
+                proof: Some(ProofIndex {
+                    file: proof_file.append(&replay.proof.proof)?,
+                    forest_rows: replay.proof_forest_rows,
+                }),
+            };
             repaired_indexes.push((index, record.entry.block_hash));
         }
     }
     proof_file.sync()?;
+    leaf_file.sync()?;
     header_index.sync()?;
     if !repaired_indexes.is_empty() {
         proof_index.append_batch(&repaired_indexes)?;
@@ -689,11 +730,14 @@ fn recoverable_journal_height(
                 retained
                     .get(&height)
                     .is_none_or(|retained_hash| *retained_hash == block_hash)
-                    && proof_file.contains(index)
-                    && retained
-                        .contains_key(&height)
-                        .then(|| proof_file.get(index).is_some())
-                        .unwrap_or(true)
+                    && index.proof.is_some_and(|proof| {
+                        proof_file.contains(&proof.file)
+                            && (!retained.contains_key(&height)
+                                || proof_file.get(&proof.file).is_some())
+                    })
+                    && leaf_file.contains(&index.leaf_data)
+                    && (!retained.contains_key(&height)
+                        || leaf_file.get(&index.leaf_data).is_some())
             });
         if valid {
             continue;
@@ -739,6 +783,7 @@ impl FlatFileProver {
         journal_path: PathBuf,
         leaf_map_path: &Path,
         proof_file: Arc<ProofFile>,
+        leaf_file: Arc<LeafFile>,
         proof_index: Arc<BlocksIndex>,
         recent_blocks: Arc<RecentBlocks>,
         bootstrap_height: u32,
@@ -764,6 +809,7 @@ impl FlatFileProver {
             &header_index,
             &proof_index,
             &proof_file,
+            &leaf_file,
             indexed_height,
             bootstrap_height,
         )?;
@@ -803,7 +849,7 @@ impl FlatFileProver {
                         continue;
                     }
                     header_index.remove(record.entry.height, record.entry.block_hash)?;
-                    proof_index.remove(record.entry.block_hash)?;
+                    proof_index.remove_proof(record.entry.block_hash)?;
                 }
             }
         }
@@ -845,10 +891,11 @@ impl FlatFileProver {
             let index = proof_index.get_index(tip_hash)?.ok_or_else(|| {
                 anyhow::anyhow!("proof index is missing recovered height {height}")
             })?;
-            if proof_file.get(&index).is_none() {
-                anyhow::bail!("proof data at recovered height {height} is unreadable");
+            let proof = index.proof.context("recovered block has no proof")?;
+            if proof_file.get(&proof.file).is_none() || leaf_file.get(&index.leaf_data).is_none() {
+                anyhow::bail!("proof or leaf data at recovered height {height} is unreadable");
             }
-            Some(index)
+            Some(proof.file)
         } else {
             None
         };
@@ -880,6 +927,7 @@ impl FlatFileProver {
             journal: Arc::clone(&journal),
             publisher,
             proof_file,
+            leaf_file,
             proof_index,
             header_index: Arc::clone(&header_index),
             recent_blocks: Arc::clone(&recent_blocks),
@@ -2073,6 +2121,8 @@ mod tests {
             config.leaf_map_path = root.join("leaf-map");
             config.header_file_path = root.join("headers");
             config.header_index_path = root.join("header-index");
+            config.leaf_data_path = root.join("leaf-data");
+            config.block_index_path = root.join("proof-index");
             config.minimum_leaf_capacity = Some(1024);
             config.leaf_workers = 1;
             config.chaser_workers = 1;
@@ -2099,17 +2149,8 @@ mod tests {
                     .unwrap(),
             );
             let proof_file = Arc::new(ProofFile::new(self.root.join("proofs")).unwrap());
-            let proof_index = Arc::new(BlocksIndex {
-                database: kv::Store::new(kv::Config {
-                    path: self.root.join("proof-index"),
-                    temporary: false,
-                    use_compression: false,
-                    flush_every_ms: None,
-                    cache_capacity: None,
-                    segment_size: None,
-                })
-                .unwrap(),
-            });
+            let leaf_file = Arc::new(LeafFile::new(self.root.join("leaf-data")).unwrap());
+            let proof_index = Arc::new(BlocksIndex::open(&self.root.join("proof-index")).unwrap());
             let (sender, receiver) = std::sync::mpsc::channel();
             let prover = FlatFileProver::new(
                 self.chain.clone(),
@@ -2118,6 +2159,7 @@ mod tests {
                 self.root.join("journal"),
                 &self.root.join("leaf-map"),
                 proof_file.clone(),
+                leaf_file,
                 proof_index.clone(),
                 Arc::new(RecentBlocks::open_test(&self.root.join("recent-blocks")).unwrap()),
                 1,
@@ -2265,7 +2307,7 @@ mod tests {
             );
             expected_proofs.push(
                 proofs
-                    .get(&index.get_index(hash).unwrap().unwrap())
+                    .get(&index.get_index(hash).unwrap().unwrap().proof.unwrap().file)
                     .unwrap(),
             );
         }
@@ -2279,7 +2321,7 @@ mod tests {
             let hash = fixture.chain.get_block_hash(height).unwrap();
             assert_eq!(
                 proofs
-                    .get(&index.get_index(hash).unwrap().unwrap())
+                    .get(&index.get_index(hash).unwrap().unwrap().proof.unwrap().file)
                     .unwrap(),
                 expected
             );
@@ -2302,7 +2344,7 @@ mod tests {
         for height in 2..=5 {
             let hash = fixture.chain.get_block_hash(height).unwrap();
             let stored = index.get_index(hash).unwrap().unwrap();
-            assert!(proofs.get(&stored).is_some());
+            assert!(proofs.get(&stored.proof.unwrap().file).is_some());
         }
         for height in 2..=5 {
             assert_eq!(
@@ -2366,7 +2408,7 @@ mod tests {
         for height in 2..=101 {
             let hash = fixture.chain.get_block_hash(height).unwrap();
             assert!(proofs
-                .get(&index.get_index(hash).unwrap().unwrap())
+                .get(&index.get_index(hash).unwrap().unwrap().proof.unwrap().file)
                 .is_some());
         }
         assert!(reopened.header_index.get_by_height(102).unwrap().is_none());
@@ -2439,8 +2481,16 @@ mod tests {
                 assert_eq!(pollard_stump_roots(&reopened.pollard), advanced);
                 for (offset, (hash, expected, rows)) in expected.into_iter().enumerate() {
                     let stored = index.get_index(hash).unwrap().unwrap();
-                    assert_eq!(stored.proof_forest_rows, Some(rows));
-                    assert_eq!(proofs.get(&stored).as_ref(), Some(expected.as_ref()));
+                    assert_eq!(stored.proof.unwrap().forest_rows, rows);
+                    assert_eq!(
+                        proofs.get(&stored.proof.unwrap().file).as_ref(),
+                        Some(&expected.proof)
+                    );
+                    let leaves = LeafFile::new(fixture.root.join("leaf-data")).unwrap();
+                    assert_eq!(
+                        leaves.get(&stored.leaf_data).as_ref(),
+                        Some(&expected.leaves)
+                    );
                     assert_eq!(
                         reopened
                             .header_index
@@ -2468,13 +2518,13 @@ mod tests {
                 (
                     hash,
                     proofs
-                        .get(&index.get_index(hash).unwrap().unwrap())
+                        .get(&index.get_index(hash).unwrap().unwrap().proof.unwrap().file)
                         .unwrap(),
                 )
             })
             .collect::<Vec<_>>();
         let missing_hash = fixture.chain.get_block_hash(3).unwrap();
-        index.remove(missing_hash).unwrap();
+        index.remove_proof(missing_hash).unwrap();
         prover.header_index.remove(3, missing_hash).unwrap();
         prover.header_index.sync().unwrap();
         drop(prover);
@@ -2485,7 +2535,7 @@ mod tests {
         for (hash, expected) in expected {
             assert_eq!(
                 proofs
-                    .get(&index.get_index(hash).unwrap().unwrap())
+                    .get(&index.get_index(hash).unwrap().unwrap().proof.unwrap().file)
                     .unwrap(),
                 expected
             );
@@ -2519,6 +2569,7 @@ mod tests {
         prover.prove_range_inner(2, 100).unwrap();
         let roots_at_100 = pollard_stump_roots(&prover.pollard);
         prover.prove_range_inner(101, 104).unwrap();
+        let orphan_hash = fixture.chain.get_block_hash(101).unwrap();
         fixture.chain.blocks.lock().truncate(101);
         let observer = std::thread::spawn(move || {
             let entered = waiting.recv_timeout(Duration::from_secs(30));
@@ -2535,6 +2586,13 @@ mod tests {
         drop(prover);
         assert_eq!(index.load_height().unwrap(), 100);
         assert_eq!(notifications.try_iter().count(), PUBLICATION_BLOCKS);
+        let orphan = index.get_index(orphan_hash).unwrap().unwrap();
+        assert!(orphan.proof.is_none());
+        let leaves = LeafFile::new(fixture.root.join("leaf-data")).unwrap();
+        let retained_leaves = leaves.get(&orphan.leaf_data).unwrap();
+        assert_eq!(retained_leaves.len(), 1);
+        assert_eq!(retained_leaves[0].header_code, 200);
+        assert_eq!(retained_leaves[0].amount, 10_000);
         drop(proofs);
         drop(index);
         let (mut reopened, _, index, _) = fixture.open();
@@ -2544,6 +2602,9 @@ mod tests {
             .get_index(fixture.chain.get_block_hash(100).unwrap())
             .unwrap()
             .is_some());
+        let orphan = index.get_index(orphan_hash).unwrap().unwrap();
+        assert!(orphan.proof.is_none());
+        assert_eq!(leaves.get(&orphan.leaf_data).unwrap(), retained_leaves);
         reopened.sync_for_shutdown().unwrap();
     }
 
@@ -2694,7 +2755,7 @@ mod tests {
         for height in 2..=4 {
             let hash = fixture.chain.get_block_hash(height).unwrap();
             let entry = index.get_index(hash).unwrap().unwrap();
-            assert!(proofs.get(&entry).is_some());
+            assert!(proofs.get(&entry.proof.unwrap().file).is_some());
             assert_eq!(
                 prover.header_index.get_height(hash).unwrap(),
                 Some(height as u32)
@@ -2765,21 +2826,26 @@ mod tests {
             .unwrap();
 
         let proof_file = ProofFile::new(root.join("proofs")).unwrap();
+        let leaf_file = LeafFile::new(root.join("leaf-data")).unwrap();
         let proof = CompactBlockProof::default();
-        let index_11 = proof_file.append(&proof).unwrap();
-        let index_13 = proof_file.append(&proof).unwrap();
-        proof_file.sync().unwrap();
-        let proof_index = BlocksIndex {
-            database: kv::Store::new(kv::Config {
-                path: root.join("proof-index"),
-                temporary: false,
-                use_compression: false,
-                flush_every_ms: None,
-                cache_capacity: None,
-                segment_size: None,
-            })
-            .unwrap(),
+        let leaf_data = leaf_file.append(&proof.leaves).unwrap();
+        let index_11 = BlockIndex {
+            leaf_data,
+            proof: Some(ProofIndex {
+                file: proof_file.append(&proof.proof).unwrap(),
+                forest_rows: 7,
+            }),
         };
+        let index_13 = BlockIndex {
+            leaf_data,
+            proof: Some(ProofIndex {
+                file: proof_file.append(&proof.proof).unwrap(),
+                forest_rows: 7,
+            }),
+        };
+        proof_file.sync().unwrap();
+        leaf_file.sync().unwrap();
+        let proof_index = BlocksIndex::open(&root.join("proof-index")).unwrap();
         proof_index.append(index_11, hash_11).unwrap();
         proof_index.append(index_13, hash_13).unwrap();
         proof_index.update_height(13).unwrap();
@@ -2790,6 +2856,7 @@ mod tests {
                 &header_index,
                 &proof_index,
                 &proof_file,
+                &leaf_file,
                 13,
                 10,
             )

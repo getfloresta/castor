@@ -31,6 +31,9 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::block_index::BlockIndex;
+use crate::block_index::BlocksIndex;
+use crate::blockfile::LeafFile;
 use crate::forest_journal::ForestJournal;
 use crate::forest_journal::JournalEntry;
 use crate::forest_journal::JournalForestDelta;
@@ -41,6 +44,7 @@ use crate::header_index::HeaderIndex;
 use crate::position_timing::PositionTimer;
 use crate::position_timing::PositionTiming;
 use crate::udata::bitcoin_leaf_data::get_leaf_hash_from_parts;
+use crate::udata::CompactLeafData;
 use ahash::AHashMap;
 use ahash::AHashSet;
 use anyhow::anyhow;
@@ -55,8 +59,11 @@ use bitcoin::OutPoint;
 use bitcoin::Txid;
 use bitcoinkernel::prelude::BlockHashExt;
 use bitcoinkernel::prelude::BlockHeaderExt;
+use bitcoinkernel::prelude::BlockSpentOutputsExt;
+use bitcoinkernel::prelude::CoinExt;
 use bitcoinkernel::prelude::ScriptPubkeyExt;
 use bitcoinkernel::prelude::TransactionExt;
+use bitcoinkernel::prelude::TransactionSpentOutputsExt;
 use bitcoinkernel::prelude::TxInExt;
 use bitcoinkernel::prelude::TxOutExt;
 use bitcoinkernel::prelude::TxOutPointExt;
@@ -143,6 +150,10 @@ pub struct ParallelForestConfig {
     pub leaf_map_path: PathBuf,
     pub header_file_path: PathBuf,
     pub header_index_path: PathBuf,
+    /// Retained compact undo, independent of both hints and the proof retention window.
+    pub leaf_data_path: PathBuf,
+    /// Shared block lookup; bootstrap publishes leaf-only entries, including genesis.
+    pub block_index_path: PathBuf,
     pub minimum_leaf_capacity: Option<u64>,
     pub leaf_workers: usize,
     pub chaser_workers: usize,
@@ -155,6 +166,8 @@ impl ParallelForestConfig {
         let leaf_map_path = forest_path.with_extension("leaf-map");
         let header_file_path = forest_path.with_extension("headers");
         let header_index_path = forest_path.with_extension("header-index");
+        let leaf_data_path = forest_path.with_extension("leaf-data");
+        let block_index_path = forest_path.with_extension("block-index");
         let threads = thread::available_parallelism()
             .map(usize::from)
             .unwrap_or(1);
@@ -166,6 +179,8 @@ impl ParallelForestConfig {
             leaf_workers,
             header_file_path,
             header_index_path,
+            leaf_data_path,
+            block_index_path,
             minimum_leaf_capacity: None,
             chaser_workers,
             spin_iterations: DEFAULT_SPIN_ITERATIONS,
@@ -925,9 +940,12 @@ struct BlockVisitResult {
     kernel_wait: Duration,
     header: [u8; 80],
     block_hash: [u8; 32],
+    undo: Vec<CompactLeafData>,
 }
 
 trait BlockSource: Sync {
+    /// Visits accumulator additions and returns external input undo in transaction/input order.
+    /// Missing undo is an error, including when this block contributes no hinted leaves.
     fn visit_leaf_outputs(
         &self,
         height: u32,
@@ -1023,17 +1041,56 @@ impl BlockSource for KernelBlockSource {
         visitor: &mut dyn FnMut(LeafOutput<'_>) -> Result<()>,
     ) -> Result<BlockVisitResult> {
         let started = Instant::now();
-        let block = self.block_at_height(height)?;
+        let chain = self.manager.active_chain();
+        let entry = chain
+            .at_height(height as usize)
+            .ok_or_else(|| anyhow!("kernel active chain has no block at height {height}"))?;
+        let block = self
+            .manager
+            .read_block_data(&entry)
+            .with_context(|| format!("failed to read block data at height {height}"))?;
+        let spent = self
+            .manager
+            .read_spent_outputs(&entry)
+            .with_context(|| format!("failed to read undo data at height {height}"))?;
         let kernel_wait = started.elapsed();
         let header = block.header();
         let header_bytes = header.consensus_encode()?;
         let block_hash = header.hash().to_bytes();
+        if spent.count() != block.transaction_count().saturating_sub(1) {
+            bail!("undo transaction count mismatch at height {height}");
+        }
+        let mut undo = Vec::new();
+        // Kernel undo follows block transaction/input order, just like steady-state
+        // proof leaves. Coins created at this height are same-block spends and were
+        // never present in the preceding accumulator, so BIP183 omits them.
+        for (tx_index, tx) in block.transactions().skip(1).enumerate() {
+            let tx_spent = spent.transaction_spent_outputs(tx_index)?;
+            if tx_spent.count() != tx.input_count() {
+                bail!("undo input count mismatch at height {height}, transaction {tx_index}");
+            }
+            undo.reserve(tx_spent.count());
+            for coin in tx_spent.coins() {
+                if coin.confirmation_height() == height {
+                    continue;
+                }
+                let output = coin.output();
+                let script = output.script_pubkey();
+                undo.push(CompactLeafData::from_parts(
+                    coin.confirmation_height(),
+                    coin.is_coinbase(),
+                    u64::try_from(output.value()).context("negative undo output value")?,
+                    bitcoin::Script::from_bytes(script.as_bytes()),
+                ));
+            }
+        }
         let leaves = visit_kernel_leaf_outputs(height, &block, visitor)?;
         Ok(BlockVisitResult {
             leaves,
             kernel_wait,
             header: header_bytes,
             block_hash,
+            undo,
         })
     }
 
@@ -2151,6 +2208,8 @@ fn build_with_source<S: BlockSource, H: Hints>(
     let forest_rows = tree_rows(capacity_leaves);
     let file_nodes = forest_capacity(forest_rows)?;
     let leaf_map = Arc::new(create_leaf_map(&config.leaf_map_path, live_leaves)?);
+    let leaf_file = Arc::new(LeafFile::new(config.leaf_data_path.clone())?);
+    let block_index = Arc::new(BlocksIndex::open(&config.block_index_path)?);
     let header_index = Arc::new(HeaderIndex::create(
         &config.header_file_path,
         &config.header_index_path,
@@ -2160,6 +2219,16 @@ fn build_with_source<S: BlockSource, H: Hints>(
         let mut writer = header_index.build_writer()?;
         let (header, block_hash) = source.header(0)?;
         writer.put_batch(&[(0, header, block_hash)])?;
+        let leaf_data = leaf_file
+            .append(&[])
+            .context("failed to store genesis undo")?;
+        block_index.append(
+            BlockIndex {
+                leaf_data,
+                proof: None,
+            },
+            BlockHash::from_byte_array(block_hash),
+        )?;
     }
     let forest = Arc::new(FlatForest::create(
         &config.forest_path,
@@ -2187,6 +2256,8 @@ fn build_with_source<S: BlockSource, H: Hints>(
         &leaf_map,
         &leaf_map_entries,
         &header_index,
+        &leaf_file,
+        &block_index,
         &stats,
     )?;
 
@@ -2207,6 +2278,11 @@ fn build_with_source<S: BlockSource, H: Hints>(
     header_index
         .close()
         .context("failed to close header index")?;
+    // Publish durable index entries only after every referenced undo record is durable.
+    leaf_file.sync().context("failed to sync bootstrap undo")?;
+    block_index
+        .sync()
+        .context("failed to sync bootstrap block index")?;
     let statistics = stats.snapshot();
     debug!(
         "build stats: ranges={} avg_range_lock={:?} avg_range_processing={:?} kernel_blocks={} avg_kernel_wait={:?} index_writes={} avg_index_write={:?} forest_writes={} avg_forest_write={:?} chaser_range_waits={}",
@@ -2297,6 +2373,8 @@ fn run_builders<S: BlockSource, H: Hints>(
     leaf_map: &Arc<Database>,
     leaf_map_entries: &Arc<AtomicU64>,
     header_index: &Arc<HeaderIndex>,
+    leaf_file: &Arc<LeafFile>,
+    block_index: &Arc<BlocksIndex>,
     stats: &Arc<BuildStats>,
 ) -> Result<()> {
     thread::scope(|scope| {
@@ -2334,6 +2412,8 @@ fn run_builders<S: BlockSource, H: Hints>(
                 leaf_map: Arc::clone(leaf_map),
                 leaf_map_entries: Arc::clone(leaf_map_entries),
                 header_index: Arc::clone(header_index),
+                leaf_file: Arc::clone(leaf_file),
+                block_index: Arc::clone(block_index),
                 stats: Arc::clone(stats),
             };
             let ranges = Arc::clone(&ranges);
@@ -2419,6 +2499,8 @@ struct LeafBuildOutputs {
     leaf_map: Arc<Database>,
     leaf_map_entries: Arc<AtomicU64>,
     header_index: Arc<HeaderIndex>,
+    leaf_file: Arc<LeafFile>,
+    block_index: Arc<BlocksIndex>,
     stats: Arc<BuildStats>,
 }
 
@@ -2519,6 +2601,17 @@ fn fill_leaf_range<S: BlockSource, H: Hints>(
                 unspent[hint_position]
             );
         }
+        let leaf_data = outputs
+            .leaf_file
+            .append(&visited.undo)
+            .with_context(|| format!("failed to store undo at height {height}"))?;
+        outputs.block_index.append(
+            BlockIndex {
+                leaf_data,
+                proof: None,
+            },
+            BlockHash::from_byte_array(visited.block_hash),
+        )?;
         if !entries.is_empty() {
             let index_write_started = Instant::now();
             let indexed = writer
@@ -3099,6 +3192,42 @@ pub(crate) mod tests {
                     });
                 }
             }
+            let mut undo = Vec::new();
+            for tx in block.txdata.iter().filter(|tx| !tx.is_coinbase()) {
+                for input in &tx.input {
+                    let outpoint = input.previous_output;
+                    if spent_in_block.contains(&KernelOutPoint {
+                        txid: outpoint.txid.to_byte_array(),
+                        vout: outpoint.vout,
+                    }) {
+                        continue;
+                    }
+                    let (previous_height, previous_tx) = self.blocks[..(height - 1) as usize]
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(index, previous)| {
+                            previous
+                                .txdata
+                                .iter()
+                                .find(|tx| tx.compute_txid() == outpoint.txid)
+                                .map(|tx| (index as u32 + 1, tx))
+                        })
+                        .ok_or_else(|| {
+                            anyhow!("missing mock undo for {outpoint} at height {height}")
+                        })?;
+                    let output = previous_tx
+                        .output
+                        .get(outpoint.vout as usize)
+                        .ok_or_else(|| anyhow!("missing mock undo output {outpoint}"))?;
+                    undo.push(CompactLeafData::from_parts(
+                        previous_height,
+                        previous_tx.is_coinbase(),
+                        output.value.to_sat(),
+                        &output.script_pubkey,
+                    ));
+                }
+            }
 
             let block_hash = block.block_hash().to_byte_array();
             let bip30_exclusion = bip30_excluded_outpoint(height);
@@ -3136,6 +3265,7 @@ pub(crate) mod tests {
                 kernel_wait: Duration::ZERO,
                 header: bytes,
                 block_hash: block.header.block_hash().to_byte_array(),
+                undo,
             })
         }
 
@@ -3188,6 +3318,8 @@ pub(crate) mod tests {
                 kernel_wait: Duration::ZERO,
                 header: bitcoin::consensus::serialize(&header).try_into().unwrap(),
                 block_hash: header.block_hash().to_byte_array(),
+                // This synthetic BIP30 fixture contains only coinbase outputs.
+                undo: Vec::new(),
             })
         }
 
@@ -3298,6 +3430,138 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(leaf_map_path).unwrap();
         std::fs::remove_file(path.with_extension("headers")).unwrap();
         std::fs::remove_dir_all(path.with_extension("header-index")).unwrap();
+        std::fs::remove_file(path.with_extension("leaf-data")).unwrap();
+        std::fs::remove_dir_all(path.with_extension("block-index")).unwrap();
+    }
+
+    #[test]
+    fn bootstrap_retains_historical_undo_independently_of_hints() {
+        let path = temp_forest_path();
+        let first = mock_block(1, &[11, 22, 33]);
+        let first_txid = first.txdata[0].compute_txid();
+        let mut second = mock_block(2, &[44]);
+        let mut spend = mock_block(0, &[30]).txdata.remove(0);
+        spend.input[0].previous_output = OutPoint {
+            txid: first_txid,
+            vout: 2,
+        };
+        let intermediate_txid = spend.compute_txid();
+        second.txdata.push(spend);
+        let mut spend = mock_block(0, &[39]).txdata.remove(0);
+        spend.input[0].previous_output = OutPoint {
+            txid: intermediate_txid,
+            vout: 0,
+        };
+        let mut external_input = spend.input[0].clone();
+        external_input.previous_output = OutPoint {
+            txid: first_txid,
+            vout: 0,
+        };
+        spend.input.push(external_input);
+        second.txdata.push(spend);
+        let mut third = mock_block(3, &[]);
+        let mut spend = mock_block(0, &[22]).txdata.remove(0);
+        spend.input[0].previous_output = OutPoint {
+            txid: first_txid,
+            vout: 1,
+        };
+        spend.output[0].script_pubkey = ScriptBuf::from_bytes(vec![0x6a]);
+        third.txdata.push(spend);
+        let source = MockSource {
+            blocks: vec![
+                first,
+                second,
+                third,
+                mock_block(4, &[]),
+                mock_block(5, &[55]),
+            ],
+        };
+        // Height three creates no accumulator leaves, yet spends a historical coin.
+        // No output from height one survives in the hints.
+        let hints = bridge_hints(
+            &[0, 3, 2, 0, 0, 1],
+            &[vec![], vec![], vec![0, 1], vec![], vec![], vec![0]],
+        );
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 2;
+        config.chaser_workers = 1;
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        let leaf_data_path = config.leaf_data_path.clone();
+        let block_index_path = config.block_index_path.clone();
+        build_with_source(&source, &hints, config).unwrap();
+
+        // Reopen through the consumer APIs: no build-local vectors or proof file.
+        let leaves = LeafFile::new(leaf_data_path).unwrap();
+        let index = BlocksIndex::open(&block_index_path).unwrap();
+        for height in 0..=5 {
+            let (_, hash) = source.header(height).unwrap();
+            let entry = index
+                .get_index(BlockHash::from_byte_array(hash))
+                .unwrap()
+                .unwrap();
+            assert_eq!(entry.proof, None);
+            let undo = leaves.get(&entry.leaf_data).unwrap();
+            let expected_amounts = match height {
+                2 => vec![33, 11],
+                3 => vec![22],
+                _ => vec![],
+            };
+            let expected: Vec<_> = expected_amounts
+                .into_iter()
+                .map(|amount| CompactLeafData::from_parts(1, true, amount, bitcoin::Script::new()))
+                .collect();
+            assert_eq!(undo, expected, "undo at height {height}");
+        }
+        drop(index);
+        drop(leaves);
+        remove_bootstrap_files(&path, &leaf_map_path);
+    }
+
+    #[test]
+    fn bootstrap_rejects_missing_undo() {
+        let path = temp_forest_path();
+        let mut block = mock_block(1, &[50]);
+        let mut spend = mock_block(0, &[10]).txdata.remove(0);
+        spend.input[0].previous_output = OutPoint {
+            txid: Txid::from_byte_array([9; 32]),
+            vout: 0,
+        };
+        block.txdata.push(spend);
+        let source = MockSource {
+            blocks: vec![block],
+        };
+        let hints = bridge_hints(&[0, 2], &[vec![], vec![0, 1]]);
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.lock_pages = false;
+        let leaf_map_path = config.leaf_map_path.clone();
+        let error = build_with_source(&source, &hints, config).unwrap_err();
+        assert!(error.to_string().contains("missing mock undo"));
+        remove_bootstrap_files(&path, &leaf_map_path);
+    }
+
+    #[test]
+    fn bootstrap_propagates_undo_write_failure() {
+        let path = temp_forest_path();
+        let source = MockSource {
+            blocks: vec![mock_block(1, &[50])],
+        };
+        let hints = bridge_hints(&[0, 1], &[vec![], vec![0]]);
+        let mut config = ParallelForestConfig::new(path.clone());
+        config.leaf_workers = 1;
+        config.chaser_workers = 1;
+        config.lock_pages = false;
+        config.leaf_data_path = PathBuf::from("/dev/full");
+        let error = build_with_source(&source, &hints, config).unwrap_err();
+        assert!(error.to_string().contains("failed to store genesis undo"));
+        // Genesis is persisted before creating the forest or starting workers.
+        assert!(!path.exists());
+        std::fs::remove_dir_all(path.with_extension("leaf-map")).unwrap();
+        std::fs::remove_file(path.with_extension("headers")).unwrap();
+        std::fs::remove_dir_all(path.with_extension("header-index")).unwrap();
+        std::fs::remove_dir_all(path.with_extension("block-index")).unwrap();
     }
 
     #[test]

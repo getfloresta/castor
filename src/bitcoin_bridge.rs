@@ -14,6 +14,7 @@ use clap::Parser;
 use log::info;
 
 use crate::block_index::BlocksIndex;
+use crate::blockfile::LeafFile;
 use crate::blockfile::ProofFile;
 use crate::chaininterface::Blockchain;
 use crate::chainview;
@@ -57,6 +58,8 @@ pub fn run_bridge() -> anyhow::Result<()> {
             .header_index_path
             .clone()
             .unwrap_or_else(|| subdir("header-index").into());
+        config.leaf_data_path = subdir("leaf-data").into();
+        config.block_index_path = subdir("proof-index").into();
         if let Some(workers) = cli_options.forest_leaf_workers {
             config.leaf_workers = workers;
         }
@@ -102,14 +105,22 @@ pub fn run_bridge() -> anyhow::Result<()> {
             .header_index_path
             .clone()
             .unwrap_or_else(|| subdir("header-index").into());
-        let (proof_index, proof_file, view, header_index) =
+        if !std::path::Path::new(&subdir("leaf-data")).is_file()
+            || !std::path::Path::new(&subdir("proof-index/heads")).is_file()
+        {
+            anyhow::bail!("split leaf-data storage is missing; rebuild with --build-forest before starting steady state");
+        }
+        let (proof_index, proof_file, leaf_file, view, header_index) =
             std::thread::scope(|scope| -> anyhow::Result<_> {
                 let storage = std::thread::Builder::new()
                     .name("bridge-storage-open".to_string())
                     .spawn_scoped(scope, || -> anyhow::Result<_> {
                         Ok((
-                            Arc::new(open_index(subdir("proof-index/"))?),
+                            Arc::new(BlocksIndex::open(std::path::Path::new(&subdir(
+                                "proof-index",
+                            )))?),
                             Arc::new(ProofFile::new(subdir("proofs").into())?),
+                            Arc::new(LeafFile::new(subdir("leaf-data").into())?),
                             open_chain_view(cli_options.network)?,
                             Arc::new(HeaderIndex::open(&header_file_path, &header_index_path)?),
                         ))
@@ -139,6 +150,7 @@ pub fn run_bridge() -> anyhow::Result<()> {
             subdir("forest.journal").into(),
             &leaf_map_path,
             proof_file.clone(),
+            leaf_file.clone(),
             proof_index.clone(),
             recent_blocks.clone(),
             hints.stop_height(),
@@ -151,7 +163,10 @@ pub fn run_bridge() -> anyhow::Result<()> {
             cli_options.network,
             view.clone(),
             proof_index,
-            ProofBackend::CompactProofs(proof_file),
+            ProofBackend::CompactProofs {
+                proofs: proof_file,
+                leaves: leaf_file,
+            },
             Some(client),
             Some(header_index),
             recent_blocks,
@@ -164,15 +179,9 @@ pub fn run_bridge() -> anyhow::Result<()> {
 }
 
 fn open_chain_view(network: bitcoin::Network) -> anyhow::Result<Arc<chainview::ChainView>> {
-    let store = kv::Store::new(kv::Config {
-        path: subdir("chain_view").into(),
-        temporary: false,
-        use_compression: false,
-        flush_every_ms: None,
-        cache_capacity: None,
-        segment_size: None,
-    })?;
-    let view = Arc::new(chainview::ChainView::new(store));
+    let view = Arc::new(chainview::ChainView::open(std::path::Path::new(&subdir(
+        "chain_view",
+    )))?);
     let genesis = genesis_block(network);
     if view.get_height(genesis.block_hash())? != Some(0) {
         view.save_header(genesis.block_hash(), serialize(&genesis.header))?;
@@ -212,17 +221,4 @@ fn start_p2p(
     };
     node::Node::run(p2p_address, worker_context, block_notifier)?;
     Ok(())
-}
-
-fn open_index(path: String) -> anyhow::Result<BlocksIndex> {
-    Ok(BlocksIndex {
-        database: kv::Store::new(kv::Config {
-            path: path.into(),
-            temporary: false,
-            use_compression: false,
-            flush_every_ms: Some(1000),
-            cache_capacity: Some(1_000_000),
-            segment_size: None,
-        })?,
-    })
 }

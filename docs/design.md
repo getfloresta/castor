@@ -58,9 +58,11 @@ memory-mapped flat file. The build target is the hintsfile's stop height.
 
 The builder reads the deterministic per-block leaf counts from the hintsfile prefix. From them
 it computes every block's leaf offset without reading any block. It then reads each historical
-block exactly once while the leaf workers fill the forest, leaf map and header index. Hints
-indices are interpreted over Utreexo-eligible outputs in block order. Provably unspendable
-outputs and outputs consumed in their creating block are excluded.
+block exactly once while the leaf workers fill the forest, leaf map and header index. Each
+worker also reads that block's kernel undo data and stores compact leaves, independently of
+which outputs survive in the hintsfile. Hints indices are interpreted over Utreexo-eligible
+outputs in block order. Provably unspendable outputs and outputs consumed in their creating
+block are excluded from accumulator additions.
 
 By default the CPUs are split evenly between leaf workers and chaser workers.
 `--forest-leaf-workers` and `--forest-chaser-workers` override that split.
@@ -78,6 +80,15 @@ By default the CPUs are split evenly between leaf workers and chaser workers.
   Independent ranges apply these rules concurrently while leaves are still being published.
   `--forest-spin-iterations` controls how long a chaser spins before it sleeps on the
   publication condition variable.
+
+Undo leaves follow transaction/input order, omitting same-block spends because those outputs
+never entered the preceding accumulator. Genesis and blocks with no external spends receive
+an encoded empty leaf vector, not a missing index. Missing kernel undo aborts the build.
+Workers serialize each complete leaf vector before reserving space. They load the atomic
+high watermark, CAS it to `offset + serialized_length`, retry on contention, and use positional
+writes within the reserved range. The block index becomes visible only after the entire
+write succeeds. Failed writes may leave unreferenced holes; reservations are never rolled back.
+At build completion, the leaf file is synced before the index checkpoint.
 
 `--forest-leaf-capacity` raises the initial bottom-row capacity above the bootstrap leaf count.
 It must not be lower than the leaf count encoded through the hints stop height. In steady
@@ -273,7 +284,7 @@ producer metadata lock is held across the sync.
 
 Only after publication succeeds does the worker:
 
-1. write proofs, headers and proof-index entries,
+1. write separate proof and leaf records, sync both files, then publish headers and block-index entries,
 2. apply the merged forest writes and the block-ordered leaf-map changes,
 3. sync those stores, and
 4. commit the final applied height.
@@ -362,9 +373,28 @@ count their targets use, so proofs created before and after a resize stay wire-c
 
 ### Proof storage
 
-Proofs for blocks after the hints stop height are appended to `$DATA_DIR/proofs` and indexed by
-block hash under `$DATA_DIR/proof-index`. Records contain only targets, proof hashes and compact
-leaf data. Bitcoin blocks are fetched from Core and are not stored.
+`$DATA_DIR/leaf-data` stores compact undo leaf vectors for every bootstrap and steady-state
+block. `$DATA_DIR/proofs` stores only targets and proof hashes, generated after the hints stop
+height. Both files allocate append ranges through an atomic high watermark and positional
+writes. Only the proof file can be truncated; leaf records are retained across recovery and reorgs.
+
+`$DATA_DIR/proof-index` uses `floresta-db`. A `BlockIndex` contains a mandatory leaf `FileIndex`
+(`offset`, `size`) and an optional `ProofIndex` (proof `FileIndex`, logical `forest_rows`).
+The combined `CompactBlockProof` remains the journal/in-memory representation; splitting
+disk records does not change its journal encoding.
+
+Index updates append new logical versions using `write_only().put_batch()`, never replacing
+or deleting nodes while readers run. Rollback appends a leaf-only version. Records retain the
+full block hash and reject mismatches against the database's truncated 16-byte key. Publication
+checkpoints are serialized by the persistence worker, and startup recovers from the latest
+valid checkpoint rather than trusting mutable runtime files. Checkpoints retain the newest
+logical version; restarting also reclaims superseded runtime versions. Checkpoint traversal,
+filesystem I/O and the existing forest/header mutation locks are outside the lock-free
+append/read path.
+
+The auxiliary `chain_view` cache also uses append-only `floresta-db` records. It checkpoints
+when its last owner drops; a crash may discard recent cache entries, which are reloadable
+from the canonical header index or Core.
 
 ### Shutdown and reorgs
 
@@ -403,11 +433,15 @@ durations are totals for the whole window.
 
 ## Crash recovery and compatibility
 
+The split leaf/proof files and `floresta-db` block/cache indexes are a storage-format cutover.
+Rebuild with `--build-forest` in a new or empty `DATA_DIR`; legacy combined proofs and `kv`
+directories are rejected rather than silently interpreted as empty storage.
+
 ### Startup recovery
 
 At startup, Castor discards every byte beyond the last valid publication boundary, including
-complete checksummed records that reached disk. Published records carry enough data to restore
-headers and compact proofs, as well as forest and leaf-map changes, if they were interrupted
+complete checksummed journal records that reached disk. Published records carry enough data to restore
+headers, proofs and leaf data, as well as forest and leaf-map changes, if they were interrupted
 while being applied. The applied-height checkpoint is separate from the published journal tip.
 
 If publication fails, submissions stop and a clean shutdown is never certified. If it's
@@ -484,7 +518,7 @@ served. Clients must get blocks from a separate Bitcoin peer.
 | --- | --- |
 | Inbound peers | at most 64 |
 | Handshake | expires after 10 seconds; at most 1 MiB and 64 packets |
-| Established peers | disconnected for packets over 256 KiB, oversized request batches, or more than 100 packets per second sustained |
+| Established peers | disconnected for packets over 256 KiB, oversized request batches, or more than 10,000 packets per second sustained |
 
 Every minute, the node logs the total number of connected peers, grouped by their sanitized,
 self-reported software name (for example `Floresta=10 Satoshi=10`).
@@ -508,6 +542,13 @@ none.
 
 Stored proof targets already use the 63-row wire layout, and P2P serves them unchanged.
 Physical or logical forest-row metadata must not trigger another translation.
+
+Leaf-only requests work for every indexed bootstrap block without opening the proof file.
+Proof hashes or targets require a stored proof; a nonzero proof bitmap also selects proof
+data. If any requested component is unavailable, the reply is `notfound` containing
+`Inventory::Block(block_hash)`, rather than silence or a partial response. BIP183 has no
+dedicated block-proof inventory type. Unknown blocks likewise receive `notfound`.
+Unrequested components are not read, so missing proof bytes cannot prevent a leaf-only reply.
 
 ### `getheaders`
 
